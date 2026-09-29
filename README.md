@@ -9,9 +9,31 @@ Proyek Deep Learning berbasis **PyTorch** dan arsitektur **EfficientNet-B0** unt
 - **Transfer Learning State-of-the-Art**: Menggunakan backbone pretrained **EfficientNet-B0** yang ringan, cepat, dan memiliki akurasi tinggi.
 - **Dukungan Akselerasi GPU NVIDIA (CUDA)**: Teroptimasi untuk berjalan di GPU (misal: NVIDIA GeForce RTX 4050 Laptop GPU) menggunakan CUDA 12.6.
 - **Integrasi Hugging Face Datasets**: Pemuatan dan pemrosesan dataset langsung dari Hugging Face Hub dengan format streaming/caching otomatis.
+- **Penyimpanan Dataset Lokal Proyek**: Opsi `cache_dir="./data"` untuk menyimpan data langsung di direktori proyek.
 - **Augmentasi Data Dinamis**: Resizing ke resolusi standar (224x224), *Random Horizontal Flip*, dan *Random Rotation* untuk mencegah overfitting.
 - **Checkpoint Otomatis**: Menyimpan bobot model terbaik (`best_efficientnet_b0_ai_vs_real.pth`) berdasarkan nilai akurasi validasi tertinggi.
 - **Fungsi Inferensi Cepat**: Fungsi `predict_image()` bawaan untuk menguji gambar baru dengan output probabilitas keyakinan (*confidence score*).
+
+---
+
+## 🔗 Referensi & Sumber Kode Asli
+
+Kode dasar dan arsitektur alur kerja proyek ini diadaptasi dan dikembangkan dari notebook Kaggle berikut:
+
+- **Original Kaggle Notebook**:  
+  👉 [AI vs Real Image Classification (EfficientNet-B0) by Min Khant Tin](https://www.kaggle.com/code/minkhanttin/ai-vs-real-image-classification-efficientnet-b0)
+
+---
+
+## 📊 Dataset yang Digunakan
+
+Proyek ini mendukung dan telah dieksplorasi menggunakan beberapa dataset dari Hugging Face Hub:
+
+| Nama Dataset | Tautan Hugging Face | Deskripsi & Rekomendasi |
+| :--- | :--- | :--- |
+| **`theminji/AI-vs-Real-balanced`** | [theminji/AI-vs-Real-balanced](https://huggingface.co/datasets/theminji/AI-vs-Real-balanced) | **Dataset Utama Aktif**: Pembagian split `train` (128.762) dan `validation` (14.308) sudah seimbang secara resmi dari pembuat dataset (~143k total gambar). |
+| **`Parveshiiii/AI-vs-Real`** | [Parveshiiii/AI-vs-Real](https://huggingface.co/datasets/Parveshiiii/AI-vs-Real) | Sangat direkomendasikan untuk deteksi foto realistis kamera (potret manusia, objek nyata, pemandangan) (~14k gambar). |
+| **`Thunderbeast/AI-Generated-vs-Real-Images-Datasets`** | [Thunderbeast/AI-Generated-vs-Real-Images-Datasets](https://huggingface.co/datasets/Thunderbeast/AI-Generated-vs-Real-Images-Datasets) | Dataset ilustrasi dan seni digital (`AiArtData` vs `RealArt`) (~152k gambar). |
 
 ---
 
@@ -21,7 +43,9 @@ Proyek Deep Learning berbasis **PyTorch** dan arsitektur **EfficientNet-B0** unt
 AI VS REAL/
 ├── AI vs Real image detection.ipynb    # Notebook utama pelatihan & evaluasi model
 ├── best_efficientnet_b0_ai_vs_real.pth # Bobot model terbaik hasil pelatihan
-├── .gitignore                         # Mengabaikan file gambar pengujian
+├── backup/                            # Cadangan file bobot model (.pth)
+├── data/                              # Cache dataset lokal proyek (opsional)
+├── .gitignore                         # Mengabaikan file gambar uji, backup, & cache dataset
 └── README.md                          # Dokumentasi proyek
 ```
 
@@ -29,21 +53,19 @@ AI VS REAL/
 
 ## 🗃️ Lokasi Cache Dataset
 
-Saat fungsi `load_dataset()` dieksekusi, file dataset dari Hugging Face secara otomatis di-cache di komputer lokal Anda:
+Dataset yang diunduh dari Hugging Face dapat disimpan di dua tempat:
 
-- **File mentah / shard unduhan (Hub Cache)**:
-  ```text
-  C:\Users\<Username>\.cache\huggingface\hub\datasets--<author>--<dataset-name>
-  ```
-  *Contoh:*
-  - `datasets--Parveshiiii--AI-vs-Real`
-  - `datasets--Thunderbeast--AI-Generated-vs-Real-Images-Datasets`
-  - `datasets--theminji--AI-vs-Real-balanced`
-
-- **File Arrow siap pakai**:
-  ```text
-  C:\Users\<Username>\.cache\huggingface\datasets
-  ```
+1. **Di Folder Proyek Lokal (Direkomendasikan)**:
+   Dengan menambahkan argumen `cache_dir="./data"` pada `load_dataset()`, file dataset akan tersimpan di dalam folder proyek `data/`.
+2. **Di Cache Global Hugging Face (Default)**:
+   - **File mentah / shard unduhan (Hub Cache)**:
+     ```text
+     C:\Users\<Username>\.cache\huggingface\hub\datasets--<author>--<dataset-name>
+     ```
+   - **File Arrow siap pakai**:
+     ```text
+     C:\Users\<Username>\.cache\huggingface\datasets
+     ```
 
 ---
 
@@ -74,14 +96,19 @@ Buka dan jalankan sel di file notebook **`AI vs Real image detection.ipynb`**:
 Mendeteksi ketersediaan GPU NVIDIA (CUDA):
 ```python
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"Device yang digunakan: {device} ({torch.cuda.get_device_name(0)})")
+if torch.cuda.is_available():
+  print(f"Device yang digunakan: {device} ({torch.cuda.get_device_name(0)})")
+else:
+  print(f"Device yang digunakan: {device}")
 ```
 
 ### 2. Pemuatan Dataset
-Dataset dimuat langsung dari Hugging Face Hub:
+Dataset dimuat langsung dari Hugging Face Hub (tersimpan di folder `./data`):
 ```python
 dataset = load_dataset(
-    "theminji/AI-vs-Real-balanced", verification_mode="no_checks"
+    "theminji/AI-vs-Real-balanced",
+    cache_dir="./data",
+    verification_mode="no_checks",
 )
 train_hf = dataset["train"]
 val_hf = dataset["validation"]
@@ -141,18 +168,11 @@ def predict_image(image_path, model):
 
 
 # Contoh pengujian:
-predict_image("gani.jpeg", model)
+predict_image("test.jpg", model)
 ```
 
 ---
 
-## 📊 Dataset yang Didukung
-
-| Nama Dataset | Deskripsi | Rekomendasi Penggunaan |
-| :--- | :--- | :--- |
-| **`theminji/AI-vs-Real-balanced`** | Kumpulan gambar seimbang antara karya seni AI dan manusia (~143k data) | Untuk pelatihan skala besar dengan variasi seni & ilustrasi |
-
----
-
-## 📄 Lisensi
-Proyek ini dibuat untuk keperluan riset dan edukasi dalam bidang Computer Vision dan Deep Learning.
+## 📄 Lisensi & Atribusi
+- Kode referensi asli: [Min Khant Tin on Kaggle](https://www.kaggle.com/code/minkhanttin/ai-vs-real-image-classification-efficientnet-b0) (Apache 2.0 / Open Source).
+- Proyek ini dikembangkan lebih lanjut untuk keperluan riset dan edukasi dalam bidang Computer Vision.
