@@ -4,4 +4,5 @@
 *.webp
 backup
 data/
-dataset_cache/
+dataset_cache/
+ai-vs-real-image-classification-efficientnet-b0.ipynb

@@ -7,10 +7,12 @@ Proyek Deep Learning berbasis **PyTorch** dan arsitektur **EfficientNet-B0** unt
 ## 📌 Fitur Utama
 
 - **Transfer Learning State-of-the-Art**: Menggunakan backbone pretrained **EfficientNet-B0** yang ringan, cepat, dan memiliki akurasi tinggi.
-- **Dukungan Akselerasi GPU NVIDIA (CUDA)**: Teroptimasi untuk berjalan di GPU (misal: NVIDIA GeForce RTX 4050 Laptop GPU) menggunakan CUDA 12.6.
+- **Presisi Penuh (Full Precision FP32)**: Menggunakan presisi 32-bit floating point tanpa pemotongan kuantisasi demi menjaga integritas sinyal artefak forensik sub-piksel AI yang sangat halus.
+- **Regularisasi Head Berlapis (Multi-Dropout)**: Mencegah model mengalami overfitting ke fitur visual tertentu sehingga generalisasi deteksi gambar AI dunia nyata tetap optimal.
 - **Integrasi Hugging Face Datasets**: Pemuatan dan pemrosesan dataset langsung dari Hugging Face Hub dengan format streaming/caching otomatis.
 - **Penyimpanan Dataset Lokal Proyek**: Opsi `cache_dir="./data"` untuk menyimpan data langsung di direktori proyek.
-- **Augmentasi Data Dinamis**: Resizing ke resolusi standar (224x224), *Random Horizontal Flip*, dan *Random Rotation* untuk mencegah overfitting.
+- **Augmentasi Data Dinamis**: Resizing ke resolusi standar (224x224), *Random Horizontal Flip*, dan *Random Rotation* untuk mencegah overfitting tanpa merusak artefak forensik AI.
+- **Evaluasi Komprehensif**: Dilengkapi Classification Report (Precision, Recall, F1-Score) dan visualisasi Confusion Matrix menggunakan `scikit-learn`.
 - **Checkpoint Otomatis**: Menyimpan bobot model terbaik (`best_efficientnet_b0_ai_vs_real.pth`) berdasarkan nilai akurasi validasi tertinggi.
 - **Fungsi Inferensi Cepat**: Fungsi `predict_image()` bawaan untuk menguji gambar baru dengan output probabilitas keyakinan (*confidence score*).
 
@@ -83,7 +85,7 @@ Jalankan perintah berikut di Terminal / PowerShell untuk memasang PyTorch versi 
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126 --upgrade --force-reinstall
 
 # Instal pustaka data science & Hugging Face
-pip install datasets pillow numpy matplotlib ipywidgets
+pip install datasets pillow numpy matplotlib scikit-learn ipywidgets
 ```
 
 ---
@@ -97,9 +99,9 @@ Mendeteksi ketersediaan GPU NVIDIA (CUDA):
 ```python
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 if torch.cuda.is_available():
-  print(f"Device yang digunakan: {device} ({torch.cuda.get_device_name(0)})")
+    print(f"Device yang digunakan: {device} ({torch.cuda.get_device_name(0)})")
 else:
-  print(f"Device yang digunakan: {device}")
+    print(f"Device yang digunakan: {device}")
 ```
 
 ### 2. Pemuatan Dataset
@@ -126,19 +128,26 @@ train_transforms = transforms.Compose([
 ])
 ```
 
-### 4. Konfigurasi Arsitektur Model
-Mengganti head classifier EfficientNet-B0 menjadi output 2 kelas (`0: AI-Generated`, `1: Real Image`):
+### 4. Konfigurasi Arsitektur Model & Optimizer
+Mengonfigurasi classifier head dengan regularisasi dropout untuk 2 kelas (`0: AI-Generated`, `1: Real Image`), serta optimizer AdamW:
 ```python
 model = models.efficientnet_b0(weights=models.EfficientNet_B0_Weights.DEFAULT)
 in_features = model.classifier[1].in_features
 model.classifier[1] = nn.Sequential(
-    nn.Dropout(p=0.2, inplace=True), nn.Linear(in_features, 2)
+    nn.Dropout(p=0.2, inplace=True),
+    nn.Linear(in_features, 2)
 )
 model = model.to(device)
+
+criterion = nn.CrossEntropyLoss()
+optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-2)
 ```
 
-### 5. Pelatihan
-Model dilatih menggunakan **CrossEntropyLoss** dan optimizer **AdamW** (`lr=1e-4`, `weight_decay=1e-2`) selama 5 epoch. Model dengan akurasi validasi tertinggi akan disimpan otomatis ke `best_efficientnet_b0_ai_vs_real.pth`.
+### 5. Pelatihan Full Precision FP32
+Model dilatih menggunakan **CrossEntropyLoss** dan optimizer **AdamW** dalam presisi penuh FP32 selama 5 epoch. Model dengan akurasi validasi tertinggi akan disimpan otomatis ke `best_efficientnet_b0_ai_vs_real.pth`.
+
+### 6. Evaluasi Metrik & Confusion Matrix
+Menggunakan model terbaik untuk mengevaluasi dataset validasi secara mendalam dengan **Classification Report** (Precision, Recall, F1-Score) dan visualisasi **Confusion Matrix**.
 
 ---
 
