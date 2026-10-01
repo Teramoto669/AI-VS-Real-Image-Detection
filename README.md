@@ -45,6 +45,10 @@ Proyek ini mendukung dan telah dieksplorasi menggunakan beberapa dataset dari Hu
 AI VS REAL/
 ├── AI vs Real image detection.ipynb    # Notebook utama pelatihan & evaluasi model
 ├── best_efficientnet_b0_ai_vs_real.pth # Bobot model terbaik hasil pelatihan
+├── app.py                             # Aplikasi antarmuka Web UI (Streamlit)
+├── requirements.txt                   # Daftar pustaka dependensi proyek
+├── .streamlit/
+│   └── config.toml                    # Konfigurasi Streamlit & batas upload
 ├── backup/                            # Cadangan file bobot model (.pth)
 ├── data/                              # Cache dataset lokal proyek (opsional)
 ├── .gitignore                         # Mengabaikan file gambar uji, backup, & cache dataset
@@ -179,6 +183,31 @@ def predict_image(image_path, model):
 # Contoh pengujian:
 predict_image("test.jpg", model)
 ```
+
+---
+
+## 🌐 Menjalankan Antarmuka Web Streamlit
+
+Aplikasi UI interaktif berbasis **Streamlit** telah disediakan untuk mempermudah pengujian gambar secara langsung melalui antarmuka web.
+
+### Fitur UI:
+1. **Unggah Fleksibel (Drag & Drop & Clipboard Paste)**: 
+   - Mendukung drag-and-drop file gambar langsung ke area uploader.
+   - Mendukung penempelan citra langsung dari papan klip (*paste clipboard*) melalui tombol khusus maupun pintasan keyboard `Ctrl + V`.
+   - Format yang didukung: JPG, JPEG, PNG, dan WEBP.
+2. **Pembatasan Ukuran File 2 MB**: Sistem secara otomatis membatasi dan memvalidasi ukuran file (baik dari file maupun clipboard) agar tidak melebihi 2 MB.
+3. **Hasil Klasifikasi Real-time**: Menampilkan status **AI-Generated** atau **Real Image** dengan tampilan minimalis dan kontras jelas.
+4. **Metrik Keyakinan & Distribusi**: Menampilkan persentase tingkat keyakinan (*confidence score*) serta bilah distribusi probabilitas.
+5. **Metadata File**: Menampilkan detail dimensi piksel, format, dan ukuran file gambar masukan.
+
+### Cara Menjalankan:
+Jalankan perintah berikut di Terminal / PowerShell pada direktori proyek:
+
+```bash
+streamlit run app.py
+```
+
+Aplikasi web akan otomatis terbuka di browser pada alamat default: `http://localhost:8501`.
 
 ---
 

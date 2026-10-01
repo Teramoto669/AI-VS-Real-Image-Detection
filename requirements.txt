@@ -1,0 +1,6 @@
+streamlit>=1.30.0
+streamlit-paste-button>=0.1.2
+torch
+torchvision
+Pillow>=9.0.0
+numpy
