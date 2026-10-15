@@ -111,13 +111,20 @@ else:
 ### 2. Pemuatan Dataset
 Dataset dimuat langsung dari Hugging Face Hub (tersimpan di folder `./data`):
 ```python
+# Memuat dataset Thunderbeast/AI-Generated-vs-Real-Images-Datasets
 dataset = load_dataset(
-    "theminji/AI-vs-Real-balanced",
+    "Thunderbeast/AI-Generated-vs-Real-Images-Datasets",
+    split="train",
     cache_dir="./data",
     verification_mode="no_checks",
 )
-train_hf = dataset["train"]
-val_hf = dataset["validation"]
+
+# Pembagian stratified 90% Training dan 10% Validasi
+splits = dataset.train_test_split(
+    test_size=0.10, stratify_by_column="label", seed=42
+)
+train_hf = splits["train"]
+val_hf = splits["test"]
 ```
 
 ### 3. Pipeline Data & Adapter

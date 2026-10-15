@@ -1,3 +1,6 @@
+import warnings
+warnings.filterwarnings('ignore', message='.*Palette images with Transparency.*')
+warnings.filterwarnings('ignore', message='.*xFormers is not available.*')
 import io
 import os
 import torch
@@ -5,7 +8,6 @@ import torch.nn as nn
 from torchvision import models, transforms
 from PIL import Image
 import streamlit as st
-import streamlit.components.v1 as components
 
 # Konfigurasi Halaman
 st.set_page_config(
@@ -206,77 +208,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# JavaScript Listener untuk interaksi Drag-and-Drop & Paste (Ctrl+V) langsung pada dokumen
-components.html("""
-<script>
-(function() {
-    function setupListeners() {
-        try {
-            const parentDoc = window.parent.document;
-            if (!parentDoc || parentDoc._imageListenersAttached) return;
-            parentDoc._imageListenersAttached = true;
-
-            function getFileInput() {
-                return parentDoc.querySelector('section[data-testid="stFileUploaderDropzone"] input[type="file"]') ||
-                       parentDoc.querySelector('input[type="file"]');
-            }
-
-            // Global Ctrl+V (Paste) handler
-            parentDoc.addEventListener('paste', function(e) {
-                const items = (e.clipboardData || window.clipboardData)?.items;
-                if (!items) return;
-                for (let i = 0; i < items.length; i++) {
-                    if (items[i].type.indexOf('image') !== -1) {
-                        const file = items[i].getAsFile();
-                        if (file) {
-                            const input = getFileInput();
-                            if (input) {
-                                const dt = new DataTransfer();
-                                dt.items.add(file);
-                                input.files = dt.files;
-                                input.dispatchEvent(new Event('change', { bubbles: true }));
-                            }
-                        }
-                        break;
-                    }
-                }
-            });
-
-            // Global Dragover & Drop handler agar browser tidak membuka file langsung
-            parentDoc.addEventListener('dragover', function(e) {
-                e.preventDefault();
-            });
-
-            parentDoc.addEventListener('drop', function(e) {
-                const dt = e.dataTransfer;
-                if (dt && dt.files && dt.files.length > 0) {
-                    const file = dt.files[0];
-                    if (file.type && file.type.startsWith('image/')) {
-                        const input = getFileInput();
-                        if (input && e.target !== input) {
-                            e.preventDefault();
-                            const newDt = new DataTransfer();
-                            newDt.items.add(file);
-                            input.files = newDt.files;
-                            input.dispatchEvent(new Event('change', { bubbles: true }));
-                        }
-                    }
-                }
-            });
-        } catch (e) {
-            console.debug('Listener setup:', e);
-        }
-    }
-
-    setupListeners();
-    setTimeout(setupListeners, 400);
-    setTimeout(setupListeners, 1200);
-})();
-</script>
-""", height=0, width=0)
-
-MODEL_PATH = "best_efficientnet_b0_ai_vs_real.pth"
-MAX_FILE_SIZE_MB = 2.0
+MAX_FILE_SIZE_MB = 10.0
 MAX_FILE_SIZE_BYTES = int(MAX_FILE_SIZE_MB * 1024 * 1024)
 
 # Pipeline Transformasi
@@ -286,22 +218,106 @@ transform_pipeline = transforms.Compose([
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
 ])
 
+MODELS_CONFIG = {
+    "DINOv2-Small (Meta AI)": {
+        "paths": ["best_dinov2_vits14_ai_vs_real.pth", "backup/best_dinov2_vits14_ai_vs_real.pth"],
+        "arch": "dinov2_vits14",
+        "name": "DINOv2-Small",
+        "arch_name": "Vision Transformer (ViT)",
+        "params": "22.1 Juta (Meta AI)",
+        "desc": "Self-supervised ViT Meta AI dengan deteksi patch-level yang sangat akurat.",
+    },
+    "ConvNeXt-Tiny (Meta AI)": {
+        "paths": ["best_convnext_tiny_ai_vs_real.pth", "backup/best_convnext_tiny_ai_vs_real.pth"],
+        "arch": "convnext_tiny",
+        "name": "ConvNeXt-Tiny",
+        "arch_name": "Modern ConvNet",
+        "params": "28 Juta (Meta AI)",
+        "desc": "Arsitektur ConvNet modern Meta AI yang sangat peka terhadap artefak mikro AI.",
+    },
+    "EfficientNetV2-S (Google)": {
+        "paths": ["best_efficientnet_v2_s_ai_vs_real.pth", "backup/best_efficientnet_v2_s_ai_vs_real.pth"],
+        "arch": "efficientnet_v2_s",
+        "name": "EfficientNetV2-S",
+        "arch_name": "Fused-MBConv",
+        "params": "21.5 Juta (Google)",
+        "desc": "Arsitektur Google dengan Fused-MBConv yang cepat dan sangat efisien.",
+    },
+    "AIForensicNet (Custom Net)": {
+        "paths": ["best_aiforensicnet_ai_vs_real.pth", "backup/best_aiforensicnet_ai_vs_real.pth"],
+        "arch": "aiforensicnet",
+        "name": "AIForensicNet",
+        "arch_name": "Dual-Stream Forensic CNN",
+        "params": "2.85 Juta (From Scratch)",
+        "desc": "Arsitektur kustom dual-stream (Laplacian High-Pass + Spatial RGB) dengan Squeeze-and-Excitation attention.",
+    },
+}
+
+# Deteksi model yang tersedia di penyimpanan lokal
+AVAILABLE_MODELS = {}
+for label, cfg in MODELS_CONFIG.items():
+    for p in cfg["paths"]:
+        if os.path.exists(p):
+            AVAILABLE_MODELS[label] = {**cfg, "active_path": p}
+            break
+
 
 @st.cache_resource(show_spinner=False)
-def get_model():
-    """Memuat model EfficientNet-B0 dan checkpoint bobot."""
-    if not os.path.exists(MODEL_PATH):
+def get_model(model_path: str, arch: str):
+    """Memuat model secara dinamis (DINOv2-Small, ConvNeXt-Tiny, EfficientNetV2-S, atau AIForensicNet)."""
+    if not os.path.exists(model_path):
         return None, None
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = models.efficientnet_b0(weights=None)
-    in_features = model.classifier[1].in_features
-    model.classifier[1] = nn.Sequential(
-        nn.Dropout(p=0.2, inplace=True),
-        nn.Linear(in_features, 2)
-    )
 
-    state_dict = torch.load(MODEL_PATH, map_location=device)
+    if arch == "dinov2_vits14":
+        class DINOv2AppClassifier(nn.Module):
+            def __init__(self):
+                super().__init__()
+                with warnings.catch_warnings():
+                    warnings.filterwarnings("ignore", message=".*xFormers is not available.*")
+                    warnings.filterwarnings("ignore", category=UserWarning)
+                    hub_dir = os.path.expanduser("~/.cache/torch/hub/facebookresearch_dinov2_main")
+                    if os.path.exists(hub_dir):
+                        self.backbone = torch.hub.load(hub_dir, "dinov2_vits14", source="local")
+                    else:
+                        self.backbone = torch.hub.load("facebookresearch/dinov2", "dinov2_vits14")
+
+                self.classifier = nn.Sequential(
+                    nn.Dropout(p=0.2),
+                    nn.Linear(self.backbone.embed_dim, 2)
+                )
+
+            def forward(self, x):
+                return self.classifier(self.backbone(x))
+
+        model = DINOv2AppClassifier()
+    elif arch == "convnext_tiny":
+        model = models.convnext_tiny(weights=None)
+        in_features = model.classifier[2].in_features
+        model.classifier[2] = nn.Sequential(
+            nn.Dropout(p=0.2),
+            nn.Linear(in_features, 2)
+        )
+    elif arch == "efficientnet_v2_s":
+        model = models.efficientnet_v2_s(weights=None)
+        in_features = model.classifier[1].in_features
+        model.classifier[1] = nn.Sequential(
+            nn.Dropout(p=0.2, inplace=True),
+            nn.Linear(in_features, 2)
+        )
+    elif arch == "aiforensicnet":
+        from model_custom import AIForensicNet
+        model = AIForensicNet(num_classes=2)
+    else:
+        model = models.efficientnet_b0(weights=None)
+        in_features = model.classifier[1].in_features
+        model.classifier[1] = nn.Sequential(
+            nn.Dropout(p=0.2, inplace=True),
+            nn.Linear(in_features, 2)
+        )
+
+    state_dict = torch.load(model_path, map_location=device, weights_only=False)
     model.load_state_dict(state_dict)
     model = model.to(device)
     model.eval()
@@ -311,6 +327,8 @@ def get_model():
 
 def run_inference(image: Image.Image, model: nn.Module, device: torch.device):
     """Menjalankan inferensi dan menghitung probabilitas tiap kelas."""
+    if image.mode == 'P' and 'transparency' in image.info:
+        image = image.convert('RGBA')
     rgb_image = image.convert("RGB")
     tensor_img = transform_pipeline(rgb_image).unsqueeze(0).to(device)
 
@@ -329,21 +347,41 @@ def run_inference(image: Image.Image, model: nn.Module, device: torch.device):
 # SIDEBAR
 # ==========================================
 with st.sidebar:
-    st.markdown("### Spesifikasi")
+    st.markdown("### Spesifikasi Model")
 
-    model, device = get_model()
+    if len(AVAILABLE_MODELS) > 1:
+        selected_model_label = st.selectbox(
+            "Pilih Model Deteksi",
+            options=list(AVAILABLE_MODELS.keys()),
+            index=0,
+            help="Pilih model yang ingin digunakan untuk deteksi citra."
+        )
+        active_cfg = AVAILABLE_MODELS[selected_model_label]
+        model, device = get_model(active_cfg["active_path"], active_cfg["arch"])
+    elif len(AVAILABLE_MODELS) == 1:
+        selected_model_label = list(AVAILABLE_MODELS.keys())[0]
+        active_cfg = AVAILABLE_MODELS[selected_model_label]
+        model, device = get_model(active_cfg["active_path"], active_cfg["arch"])
+    else:
+        # Default fallback jika belum ada checkpoint
+        active_cfg = list(MODELS_CONFIG.values())[0]
+        model, device = None, None
+
     device_label = "CUDA" if (device and device.type == "cuda") else "CPU"
+    status_label = "Siap" if model else "Menunggu Checkpoint"
 
     st.markdown(f"""
     <div style="margin-top: 0.5rem; margin-bottom: 1.5rem;">
-        <div class="spec-row"><span class="spec-key">Status</span><span class="spec-val">{'Siap' if model else 'Offline'}</span></div>
-        <div class="spec-row"><span class="spec-key">Model</span><span class="spec-val">EfficientNet-B0</span></div>
+        <div class="spec-row"><span class="spec-key">Status</span><span class="spec-val">{status_label}</span></div>
+        <div class="spec-row"><span class="spec-key">Model</span><span class="spec-val">{active_cfg['name']}</span></div>
+        <div class="spec-row"><span class="spec-key">Arsitektur</span><span class="spec-val">{active_cfg['arch_name']}</span></div>
+        <div class="spec-row"><span class="spec-key">Parameter</span><span class="spec-val">{active_cfg['params']}</span></div>
         <div class="spec-row"><span class="spec-key">Perangkat</span><span class="spec-val">{device_label}</span></div>
         <div class="spec-row"><span class="spec-key">Input Res</span><span class="spec-val">224 × 224 px</span></div>
-        <div class="spec-row"><span class="spec-key">Batas File</span><span class="spec-val">Maks. 2 MB</span></div>
-        <div class="spec-row"><span class="spec-key">Akurasi Val</span><span class="spec-val">97.3%</span></div>
+        <div class="spec-row"><span class="spec-key">Batas File</span><span class="spec-val">Maks. {int(MAX_FILE_SIZE_MB)} MB</span></div>
     </div>
     """, unsafe_allow_html=True)
+    st.caption(active_cfg["desc"])
 
 
 # ==========================================
@@ -364,11 +402,12 @@ with col_upload:
         "Pilih file gambar",
         type=["jpg", "jpeg", "png", "webp"],
         label_visibility="collapsed",
-        help="Batas ukuran maksimal 2 MB (format JPG, PNG, WEBP)"
+        help=f"Batas ukuran maksimal {int(MAX_FILE_SIZE_MB)} MB (format JPG, PNG, WEBP)"
     )
 
 with col_paste:
-    components.html("""
+    # Menggunakan st.iframe resmi tanpa warning deprecation
+    st.iframe("""
     <!DOCTYPE html>
     <html>
     <head>
@@ -418,42 +457,109 @@ with col_paste:
     <body>
       <button class="paste-btn" id="pasteActionBtn" title="Paste dari clipboard (atau tekan Ctrl + V)">
         <svg viewBox="0 0 24 24">
-          <path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"></path>
+          <path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1 2-2h2"></path>
           <rect x="8" y="2" width="8" height="4" rx="1" ry="1"></rect>
           <path d="M9 12h6"></path>
           <path d="M9 16h6"></path>
         </svg>
       </button>
       <script>
-        document.getElementById('pasteActionBtn').addEventListener('click', async function() {
-          try {
-            const parentDoc = window.parent.document;
-            const nav = window.parent.navigator || navigator;
-            const items = await nav.clipboard.read();
-            for (let i = 0; i < items.length; i++) {
-              const item = items[i];
-              for (let j = 0; j < item.types.length; j++) {
-                const type = item.types[j];
-                if (type.startsWith('image/')) {
-                  const blob = await item.getType(type);
-                  const ext = type.split('/')[1] || 'png';
-                  const file = new File([blob], 'clipboard_image.' + ext, { type: type });
-                  const input = parentDoc.querySelector('section[data-testid="stFileUploaderDropzone"] input[type="file"]') ||
-                                parentDoc.querySelector('input[type="file"]');
-                  if (input) {
-                    const dt = new DataTransfer();
-                    dt.items.add(file);
-                    input.files = dt.files;
-                    input.dispatchEvent(new Event('change', { bubbles: true }));
-                  }
-                  return;
-                }
+        (function() {
+          function setupListeners() {
+            try {
+              const parentDoc = window.parent.document;
+              if (!parentDoc) return;
+
+              function getFileInput() {
+                return parentDoc.querySelector('section[data-testid="stFileUploaderDropzone"] input[type="file"]') ||
+                       parentDoc.querySelector('input[type="file"]');
               }
+
+              if (!parentDoc._imageListenersAttached) {
+                parentDoc._imageListenersAttached = true;
+
+                // Global Ctrl+V handler
+                parentDoc.addEventListener('paste', function(e) {
+                  const items = (e.clipboardData || window.clipboardData)?.items;
+                  if (!items) return;
+                  for (let i = 0; i < items.length; i++) {
+                    if (items[i].type.indexOf('image') !== -1) {
+                      const file = items[i].getAsFile();
+                      if (file) {
+                        const input = getFileInput();
+                        if (input) {
+                          const dt = new DataTransfer();
+                          dt.items.add(file);
+                          input.files = dt.files;
+                          input.dispatchEvent(new Event('change', { bubbles: true }));
+                        }
+                      }
+                      break;
+                    }
+                  }
+                });
+
+                // Global Drag & Drop handler
+                parentDoc.addEventListener('dragover', function(e) { e.preventDefault(); });
+                parentDoc.addEventListener('drop', function(e) {
+                  const dt = e.dataTransfer;
+                  if (dt && dt.files && dt.files.length > 0) {
+                    const file = dt.files[0];
+                    if (file.type && file.type.startsWith('image/')) {
+                      const input = getFileInput();
+                      if (input && e.target !== input) {
+                        e.preventDefault();
+                        const newDt = new DataTransfer();
+                        newDt.items.add(file);
+                        input.files = newDt.files;
+                        input.dispatchEvent(new Event('change', { bubbles: true }));
+                      }
+                    }
+                  }
+                });
+              }
+
+              // Click handler untuk tombol Paste
+              const btn = document.getElementById('pasteActionBtn');
+              if (btn && !btn._hasClick) {
+                btn._hasClick = true;
+                btn.addEventListener('click', async function() {
+                  try {
+                    const nav = window.parent.navigator || navigator;
+                    const items = await nav.clipboard.read();
+                    for (let i = 0; i < items.length; i++) {
+                      const item = items[i];
+                      for (let j = 0; j < item.types.length; j++) {
+                        const type = item.types[j];
+                        if (type.startsWith('image/')) {
+                          const blob = await item.getType(type);
+                          const ext = type.split('/')[1] || 'png';
+                          const file = new File([blob], 'clipboard_image.' + ext, { type: type });
+                          const input = getFileInput();
+                          if (input) {
+                            const dt = new DataTransfer();
+                            dt.items.add(file);
+                            input.files = dt.files;
+                            input.dispatchEvent(new Event('change', { bubbles: true }));
+                          }
+                          return;
+                        }
+                      }
+                    }
+                  } catch (err) {
+                    console.warn('Clipboard read error:', err);
+                  }
+                });
+              }
+            } catch (e) {
+              console.debug('Listener setup error:', e);
             }
-          } catch (err) {
-            console.warn('Clipboard read error:', err);
           }
-        });
+
+          setupListeners();
+          setTimeout(setupListeners, 400);
+          setTimeout(setupListeners, 1000);
+        })();
       </script>
     </body>
     </html>
@@ -468,7 +574,7 @@ if uploaded_file is not None:
     file_mb = file_bytes / (1024 * 1024)
 
     if file_bytes > MAX_FILE_SIZE_BYTES:
-        st.error(f"Ukuran file melebihi batas 2 MB (terdeteksi: {file_mb:.2f} MB). Silakan unggah gambar yang lebih kecil.")
+        st.error(f"Ukuran file melebihi batas {int(MAX_FILE_SIZE_MB)} MB (terdeteksi: {file_mb:.2f} MB). Silakan unggah gambar yang lebih kecil.")
     else:
         try:
             active_image = Image.open(io.BytesIO(uploaded_file.read()))
@@ -499,7 +605,7 @@ if active_image is not None:
 
     with col_pred:
         if model is None:
-            st.error("Model checkpoint tidak ditemukan.")
+            st.error(f"File bobot model '{active_cfg['name']}' belum ditemukan. Silakan jalankan proses training di notebook terlebih dahulu.")
         else:
             pred_class, confidence, ai_prob, real_prob = run_inference(active_image, model, device)
             is_ai = (pred_class == 0)
@@ -510,7 +616,7 @@ if active_image is not None:
 
             st.markdown(f"""
             <div class="verdict-card {verdict_class}">
-                <div class="verdict-tag">Hasil Klasifikasi</div>
+                <div class="verdict-tag">Hasil Klasifikasi ({active_cfg['name']})</div>
                 <div class="verdict-label {label_color}">{label_text}</div>
             </div>
             """, unsafe_allow_html=True)

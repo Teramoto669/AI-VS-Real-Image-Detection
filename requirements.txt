@@ -4,3 +4,9 @@ torch
 torchvision
 Pillow>=9.0.0
 numpy
+matplotlib
+pandas
+scikit-learn
+datasets
+ipykernel
+ipywidgets
