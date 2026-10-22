@@ -251,6 +251,22 @@ MODELS_CONFIG = {
         "params": "2.85 Juta (From Scratch)",
         "desc": "Arsitektur kustom dual-stream (Laplacian High-Pass + Spatial RGB) dengan Squeeze-and-Excitation attention.",
     },
+    "AIForensicNet V2 (Optimized)": {
+        "paths": ["best_aiforensicnet_v2_ai_vs_real.pth", "backup/best_aiforensicnet_v2_ai_vs_real.pth"],
+        "arch": "aiforensicnet_v2",
+        "name": "AIForensicNet V2",
+        "arch_name": "Multi-Filter Dual-Attention CNN",
+        "params": "3.52 Juta (From Scratch)",
+        "desc": "Arsitektur kustom teroptimasi: Multi-Filter SRM + Bayar Constrained Conv + Dual Attention + Concat Pooling.",
+    },
+    "AIForensicNet V3 (Multi-Scale)": {
+        "paths": ["best_aiforensicnet_v3_ai_vs_real.pth", "backup/best_aiforensicnet_v3_ai_vs_real.pth"],
+        "arch": "aiforensicnet_v3",
+        "name": "AIForensicNet V3",
+        "arch_name": "Multi-Scale Static Bank + Mean-Std Pooling",
+        "params": "3.07 Juta (From Scratch)",
+        "desc": "Arsitektur kustom generasi ke-3: Multi-Scale Static Filter Bank (12-ch) + Dual-Stream + Mean-Std Pooling.",
+    },
 }
 
 # Deteksi model yang tersedia di penyimpanan lokal
@@ -309,6 +325,12 @@ def get_model(model_path: str, arch: str):
     elif arch == "aiforensicnet":
         from model_custom import AIForensicNet
         model = AIForensicNet(num_classes=2)
+    elif arch == "aiforensicnet_v2":
+        from model_custom import AIForensicNetV2
+        model = AIForensicNetV2(num_classes=2)
+    elif arch == "aiforensicnet_v3":
+        from model_custom import AIForensicNetV3
+        model = AIForensicNetV3(num_classes=2)
     else:
         model = models.efficientnet_b0(weights=None)
         in_features = model.classifier[1].in_features
@@ -326,15 +348,22 @@ def get_model(model_path: str, arch: str):
 
 
 def run_inference(image: Image.Image, model: nn.Module, device: torch.device):
-    """Menjalankan inferensi dan menghitung probabilitas tiap kelas."""
+    """
+    Menjalankan inferensi dengan Test-Time Augmentation (TTA: Original + Horizontal Flip)
+    untuk memaksimalkan stabilitas dan akurasi prediksi.
+    """
     if image.mode == 'P' and 'transparency' in image.info:
         image = image.convert('RGBA')
     rgb_image = image.convert("RGB")
     tensor_img = transform_pipeline(rgb_image).unsqueeze(0).to(device)
+    tensor_img_flipped = torch.flip(tensor_img, dims=[3])
 
     with torch.no_grad():
-        outputs = model(tensor_img)
-        probs = torch.softmax(outputs, dim=1)[0]
+        outputs_orig = model(tensor_img)
+        outputs_flip = model(tensor_img_flipped)
+        probs_orig = torch.softmax(outputs_orig, dim=1)[0]
+        probs_flip = torch.softmax(outputs_flip, dim=1)[0]
+        probs = (probs_orig + probs_flip) / 2.0
         confidence, predicted_idx = torch.max(probs, 0)
 
     ai_prob = probs[0].item() * 100.0

@@ -8,3 +8,4 @@ dataset_cache/
 ai-vs-real-image-classification-efficientnet-b0.ipynb
 __pycache__/
 .ipynb_checkpoints/
+.venv/
