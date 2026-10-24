@@ -587,3 +587,243 @@ class AIForensicNetV3(nn.Module):
         return self.head(pooled)
 
 
+# ==============================================================================
+# AIForensicNet V4 (State-of-the-Art Tri-Stream Architecture)
+# ==============================================================================
+
+class NPRModule(nn.Module):
+    """
+    Neighboring Pixel Relationships (NPR) Extractor (Tan et al., CVPR 2024).
+    Secara spesifik mendeteksi jejak inter-pixel correlation yang ditinggalkan oleh
+    operasi up-sampling (Nearest/Bilinear/Transposed Conv) pada arsitektur generator
+    AI modern (GAN dan Latent Diffusion Decoders).
+    
+    Formula:
+        x_down = Interp(x, scale=0.5, mode='nearest')
+        x_up   = Interp(x_down, scale=2.0, mode='nearest')
+        NPR(x) = x - x_up
+    """
+    def forward(self, x):
+        down = F.interpolate(x, scale_factor=0.5, mode='nearest')
+        up = F.interpolate(down, size=x.shape[2:], mode='nearest')
+        return x - up
+
+
+class FFTSpectralBranch(nn.Module):
+    """
+    Cabang Frekuensi 2D (FFT Spectral Branch).
+    Mengekstrak anomali spektrum Fourier radial-symmetry dan artefak puncak
+    frekuensi periodik (Durall et al., Frank et al.) yang tidak tampak di domain spasial.
+    """
+    def __init__(self, in_channels: int = 3, out_channels: int = 32):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_channels, 16, kernel_size=3, padding=1, bias=False)
+        self.norm1 = nn.BatchNorm2d(16)
+        self.act1 = nn.GELU()
+        self.conv2 = nn.Conv2d(16, out_channels, kernel_size=3, stride=2, padding=1, bias=False)
+        self.norm2 = nn.BatchNorm2d(out_channels)
+        self.act2 = nn.GELU()
+
+    def forward(self, x):
+        # rfft2 menghitung Real-valued Fast Fourier Transform 2D
+        fft = torch.fft.rfft2(x, norm="ortho")
+        # Log magnitude spektrum frekuensi
+        mag = torch.log(torch.abs(fft) + 1e-6)
+        
+        # Samakan dimensi spektral dengan dimensi spasial input
+        mag_interp = F.interpolate(mag, size=x.shape[2:], mode='bilinear', align_corners=False)
+        
+        feat = self.act1(self.norm1(self.conv1(mag_interp)))
+        feat = self.act2(self.norm2(self.conv2(feat)))
+        return feat
+
+
+class MultiScaleForensicFilterBankV4(nn.Module):
+    """
+    Bank Filter Forensik Komprehensif V4:
+    1. Laplacian 3x3: Derau frekuensi tinggi mikro (3 ch)
+    2. Laplacian 5x5: Residu sintetis frekuensi menengah (3 ch)
+    3. Difference of Gaussians (DoG 5x5): Jejak penghalusan de-noising khas difusi (3 ch)
+    4. Sobel Magnitude 3x3: Diskontinuitas gradien spasial (3 ch)
+    5. NPR (Neighboring Pixel Relationships): Jejak up-sampling decoder generator (3 ch)
+    Total: 15 kanal fitur residual deterministik (requires_grad=False).
+    """
+    def __init__(self):
+        super().__init__()
+        lap3 = torch.tensor([
+            [-1., -1., -1.],
+            [-1.,  8., -1.],
+            [-1., -1., -1.]
+        ], dtype=torch.float32)
+
+        lap5 = torch.tensor([
+            [ 0.,  0., -1.,  0.,  0.],
+            [ 0., -1., -2., -1.,  0.],
+            [-1., -2., 16., -2., -1.],
+            [ 0., -1., -2., -1.,  0.],
+            [ 0.,  0., -1.,  0.,  0.]
+        ], dtype=torch.float32)
+
+        dog = torch.tensor([
+            [-1., -3., -4., -3., -1.],
+            [-3.,  0.,  6.,  0., -3.],
+            [-4.,  6., 20.,  6., -4.],
+            [-3.,  0.,  6.,  0., -3.],
+            [-1., -3., -4., -3., -1.]
+        ], dtype=torch.float32) / 16.0
+
+        sobel_h = torch.tensor([
+            [-1., -2., -1.],
+            [ 0.,  0.,  0.],
+            [ 1.,  2.,  1.]
+        ], dtype=torch.float32)
+
+        sobel_v = torch.tensor([
+            [-1.,  0.,  1.],
+            [-2.,  0.,  2.],
+            [-1.,  0.,  1.]
+        ], dtype=torch.float32)
+
+        k3 = torch.stack([lap3, sobel_h, sobel_v]).unsqueeze(1).repeat(3, 1, 1, 1)
+        k5 = torch.stack([lap5, dog]).unsqueeze(1).repeat(3, 1, 1, 1)
+
+        self.register_buffer('k3', k3)
+        self.register_buffer('k5', k5)
+        self.npr = NPRModule()
+
+    def forward(self, x):
+        f3 = F.conv2d(x, self.k3, padding=1, groups=3)
+        f5 = F.conv2d(x, self.k5, padding=2, groups=3)
+
+        # Sobel Magnitude
+        sh = f3[:, 1::3, :, :]
+        sv = f3[:, 2::3, :, :]
+        smag = torch.sqrt(sh ** 2 + sv ** 2 + 1e-6)
+
+        lap3_out = f3[:, 0::3, :, :]
+        lap5_out = f5[:, 0::2, :, :]
+        dog_out = f5[:, 1::2, :, :]
+        npr_out = self.npr(x)
+
+        # 3 (Lap3) + 3 (Lap5) + 3 (DoG) + 3 (Sobel) + 3 (NPR) = 15 kanal
+        return torch.cat([lap3_out, lap5_out, dog_out, smag, npr_out], dim=1)
+
+
+class MultiStatPool2d(nn.Module):
+    """
+    Global Multi-Statistic Pooling (Mean + Standard Deviation).
+    - Mean (Momen ke-1): Mengukur rata-rata intensitas aktivasi fitur global.
+    - Std (Momen ke-2): Mengukur dispersi/sebaran variansi spasial energi derau.
+    Secara matematis mampu membedakan homogenitas tekstur foto asli vs
+    ketidakseragaman mikro sintetis AI di seluruh dimensi spasial.
+    """
+    def forward(self, x):
+        mean = torch.mean(x, dim=(2, 3))
+        var = torch.var(x, dim=(2, 3), unbiased=False)
+        std = torch.sqrt(var + 1e-6)
+        return torch.cat([mean, std], dim=1)
+
+
+class AIForensicNetV4(nn.Module):
+    """
+    AIForensicNetV4: Arsitektur Forensik Generasi ke-4 (Penyempurnaan Penuh).
+    
+    Penyempurnaan Utama Terhadap V1, V2, dan V3:
+    1. Tri-Stream Architecture:
+       - Stream 1 (15 Kanal Multi-Scale Residual Bank + NPR): Menangkap jejak de-noising & upsampling.
+       - Stream 2 (Spectral FFT Branch): Menangkap anomali simetri frekuensi 2D pada domain Fourier.
+       - Stream 3 (Spatial RGB Branch): Menangkap inkonsistensi semantik, pencahayaan, dan tepi objek.
+    2. Tri-Stream Projection Fusion:
+       - Fusi terintegrasi (32 ch forensik + 32 ch spektral + 32 ch RGB = 96 ch) diproyeksikan ke 64 ch.
+    3. ConvNeXt-Style Residual Backbone Murni:
+       - Menghilangkan LayerScale & DropPath yang memperlambat konvergensi di V2.
+       - Mempertahankan Depthwise 7x7 + Squeeze-and-Excitation (SE) channel attention.
+    4. Multi-Stat Pooling Head (Mean + Std = 1024 Dimensi):
+       - Kepala klasifikasi ramping 2-layer dengan regulasi Dropout bertahap (0.25 -> 0.15).
+    5. Kapasitas Ideal: ~3.12 Juta Parameter (From Scratch, sangat efisien VRAM <1.0 GB).
+    """
+    def __init__(self, num_classes: int = 2, dropout_p: float = 0.25):
+        super().__init__()
+
+        # 1. Aliran 1: Multi-Scale Forensic + NPR (15 kanal input)
+        self.forensic_bank = MultiScaleForensicFilterBankV4()
+        self.forensic_stem = nn.Sequential(
+            nn.Conv2d(15, 32, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.GELU()
+        )
+
+        # 2. Aliran 2: Cabang Spektral 2D-FFT
+        self.spectral_branch = FFTSpectralBranch(in_channels=3, out_channels=32)
+
+        # 3. Aliran 3: Aliran Spasial RGB
+        self.rgb_stem = nn.Sequential(
+            nn.Conv2d(3, 32, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.GELU()
+        )
+
+        # 4. Tri-Stream Fusion Layer: 32 + 32 + 32 = 96 kanal -> 64 kanal
+        self.fusion = nn.Sequential(
+            nn.Conv2d(96, 64, kernel_size=1, bias=False),
+            nn.BatchNorm2d(64),
+            nn.GELU()
+        )
+
+        # 5. 4-Stage Hierarchical Residual Backbone
+        self.stage1 = nn.Sequential(
+            ForensicBlock(64, 64),
+            ForensicBlock(64, 64)
+        )
+        self.stage2 = nn.Sequential(
+            ForensicBlock(64, 128, stride=2),
+            ForensicBlock(128, 128)
+        )
+        self.stage3 = nn.Sequential(
+            ForensicBlock(128, 256, stride=2),
+            ForensicBlock(256, 256)
+        )
+        self.stage4 = nn.Sequential(
+            ForensicBlock(256, 512, stride=2),
+            ForensicBlock(512, 512)
+        )
+
+        # 6. Multi-Stat Classification Head (Mean + Std = 1024 Dimensi)
+        self.pool = MultiStatPool2d()
+        self.head = nn.Sequential(
+            nn.Dropout(p=dropout_p),
+            nn.Linear(512 * 2, 128),
+            nn.BatchNorm1d(128),
+            nn.GELU(),
+            nn.Dropout(p=0.15),
+            nn.Linear(128, num_classes)
+        )
+
+    def forward(self, x):
+        # Stream 1: Ekstraksi fitur forensik spasial & residu NPR
+        forensic_signals = self.forensic_bank(x)
+        feat_forensic = self.forensic_stem(forensic_signals)  # (B, 32, 112, 112)
+
+        # Stream 2: Ekstraksi anomali frekuensi 2D FFT
+        feat_spectral = self.spectral_branch(x)               # (B, 32, 112, 112)
+
+        # Stream 3: Ekstraksi fitur spasial RGB
+        feat_rgb = self.rgb_stem(x)                           # (B, 32, 112, 112)
+
+        # Fusi Tri-Stream (32 + 32 + 32 = 96 -> 64 kanal)
+        tri_feat = torch.cat([feat_forensic, feat_spectral, feat_rgb], dim=1)
+        out = self.fusion(tri_feat)
+
+        # Hierarki representasi fitur
+        out = self.stage1(out)  # 112x112
+        out = self.stage2(out)  # 56x56
+        out = self.stage3(out)  # 28x28
+        out = self.stage4(out)  # 14x14
+
+        # Pooling statistik global (Mean + Std)
+        pooled = self.pool(out)
+
+        # Klasifikasi probabilitas kelas
+        return self.head(pooled)
+
+

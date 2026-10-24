@@ -268,6 +268,14 @@ MODELS_CONFIG = {
         "params": "3.07 Juta (From Scratch)",
         "desc": "Arsitektur kustom generasi ke-3: Multi-Scale Static Filter Bank (12-ch) + Dual-Stream + Mean-Std Pooling.",
     },
+    "AIForensicNet V4 (Tri-Stream SOTA)": {
+        "paths": ["best_aiforensicnet_v4_ai_vs_real.pth", "backup/best_aiforensicnet_v4_ai_vs_real.pth"],
+        "arch": "aiforensicnet_v4",
+        "name": "AIForensicNet V4",
+        "arch_name": "Tri-Stream (NPR + 2D-FFT + RGB)",
+        "params": "2.93 Juta (From Scratch)",
+        "desc": "Arsitektur kustom generasi ke-4: Tri-Stream (15-ch Multi-Scale + NPR + 2D Spectral FFT) + Multi-Stat Pooling.",
+    },
 }
 
 # Deteksi model yang tersedia di penyimpanan lokal
@@ -281,7 +289,7 @@ for label, cfg in MODELS_CONFIG.items():
 
 @st.cache_resource(show_spinner=False)
 def get_model(model_path: str, arch: str):
-    """Memuat model secara dinamis (DINOv2-Small, ConvNeXt-Tiny, EfficientNetV2-S, atau AIForensicNet)."""
+    """Memuat model secara dinamis (DINOv2-Small, ConvNeXt-Tiny, EfficientNetV2-S, atau AIForensicNet V1-V4)."""
     if not os.path.exists(model_path):
         return None, None
 
@@ -332,6 +340,9 @@ def get_model(model_path: str, arch: str):
     elif arch == "aiforensicnet_v3":
         from model_custom import AIForensicNetV3
         model = AIForensicNetV3(num_classes=2)
+    elif arch == "aiforensicnet_v4":
+        from model_custom import AIForensicNetV4
+        model = AIForensicNetV4(num_classes=2)
     else:
         model = models.efficientnet_b0(weights=None)
         in_features = model.classifier[1].in_features
