@@ -8,6 +8,7 @@ import torch.nn as nn
 from torchvision import models, transforms
 from PIL import Image
 import streamlit as st
+import streamlit.components.v1 as components
 
 # Konfigurasi Halaman
 st.set_page_config(
@@ -119,6 +120,11 @@ st.markdown("""
         border: 1px solid rgba(16, 185, 129, 0.3);
     }
 
+    .verdict-modified {
+        background: rgba(245, 158, 11, 0.09);
+        border: 1px solid rgba(245, 158, 11, 0.38);
+    }
+
     .verdict-tag {
         font-size: 0.75rem;
         font-weight: 600;
@@ -129,9 +135,10 @@ st.markdown("""
     }
 
     .verdict-label {
-        font-size: 1.5rem;
+        font-size: 1.45rem;
         font-weight: 700;
         letter-spacing: -0.01em;
+        line-height: 1.35;
         margin: 0;
     }
 
@@ -141,6 +148,11 @@ st.markdown("""
 
     .label-real {
         color: #34D399;
+    }
+
+    .label-modified {
+        color: #FBBF24;
+        font-size: 1.15rem;
     }
 
     /* Stat Box */
@@ -187,23 +199,98 @@ st.markdown("""
         justify-content: space-between;
     }
 
-    /* Sidebar spec rows */
+    /* Sidebar styling */
+    .sidebar-spec-card {
+        background: #111827;
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        border-radius: 8px;
+        padding: 0.5rem 0.85rem;
+        margin-top: 0.75rem;
+        margin-bottom: 0.75rem;
+    }
+
     .spec-row {
         display: flex;
         justify-content: space-between;
+        align-items: flex-start;
+        gap: 0.75rem;
         padding: 0.45rem 0;
-        border-bottom: 1px solid rgba(255, 255, 255, 0.06);
-        font-size: 0.85rem;
+        border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+        font-size: 0.82rem;
+        line-height: 1.35;
+    }
+
+    .spec-row:last-child {
+        border-bottom: none;
     }
 
     .spec-key {
-        color: #64748B;
+        color: #94A3B8;
+        font-weight: 500;
+        flex-shrink: 0;
+        min-width: 76px;
     }
 
     .spec-val {
-        color: #E2E8F0;
-        font-weight: 500;
-        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+        color: #F1F5F9;
+        font-weight: 600;
+        text-align: right;
+        flex-grow: 1;
+        word-break: normal;
+        overflow-wrap: break-word;
+    }
+
+    .spec-val-badge {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.35rem;
+        color: #34D399;
+        font-weight: 600;
+    }
+
+    .spec-val-badge-wait {
+        display: inline-flex;
+        align-items: center;
+        gap: 0.35rem;
+        color: #F87171;
+        font-weight: 600;
+    }
+
+    .status-dot {
+        width: 7px;
+        height: 7px;
+        border-radius: 50%;
+        background-color: #10B981;
+        display: inline-block;
+        box-shadow: 0 0 6px rgba(16, 185, 129, 0.5);
+    }
+
+    .status-dot-wait {
+        width: 7px;
+        height: 7px;
+        border-radius: 50%;
+        background-color: #EF4444;
+        display: inline-block;
+        box-shadow: 0 0 6px rgba(239, 68, 68, 0.5);
+    }
+
+    .spec-desc-box {
+        background: rgba(255, 255, 255, 0.02);
+        border: 1px solid rgba(255, 255, 255, 0.06);
+        border-radius: 8px;
+        padding: 0.75rem 0.85rem;
+        font-size: 0.8rem;
+        color: #94A3B8;
+        line-height: 1.5;
+    }
+
+    .spec-desc-label {
+        font-size: 0.68rem;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+        color: #64748B;
+        margin-bottom: 0.3rem;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -267,6 +354,14 @@ MODELS_CONFIG = {
         "params": "3.07 Juta (From Scratch)",
         "desc": "Arsitektur kustom generasi ke-3: Multi-Scale Static Filter Bank (12-ch) + Dual-Stream + Mean-Std Pooling.",
     },
+    "AIForensicNet V4 (Tri-Stream SOTA)": {
+        "paths": ["best_aiforensicnet_v4_ai_vs_real.pth", "backup/best_aiforensicnet_v4_ai_vs_real.pth"],
+        "arch": "aiforensicnet_v4",
+        "name": "AIForensicNet V4",
+        "arch_name": "Tri-Stream (NPR + 2D-FFT + RGB)",
+        "params": "2.93 Juta (From Scratch)",
+        "desc": "Arsitektur kustom generasi ke-4: Tri-Stream (15-ch Multi-Scale + NPR + 2D Spectral FFT) + Multi-Stat Pooling.",
+    },
 }
 
 # Deteksi model yang tersedia di penyimpanan lokal
@@ -280,7 +375,7 @@ for label, cfg in MODELS_CONFIG.items():
 
 @st.cache_resource(show_spinner=False)
 def get_model(model_path: str, arch: str):
-    """Memuat model secara dinamis (DINOv2-Small, ConvNeXt-Tiny, EfficientNetV2-S, atau AIForensicNet)."""
+    """Memuat model secara dinamis (DINOv2-Small, ConvNeXt-Tiny, EfficientNetV2-S, atau AIForensicNet V1-V4)."""
     if not os.path.exists(model_path):
         return None, None
 
@@ -331,6 +426,9 @@ def get_model(model_path: str, arch: str):
     elif arch == "aiforensicnet_v3":
         from model_custom import AIForensicNetV3
         model = AIForensicNetV3(num_classes=2)
+    elif arch == "aiforensicnet_v4":
+        from model_custom import AIForensicNetV4
+        model = AIForensicNetV4(num_classes=2)
     else:
         model = models.efficientnet_b0(weights=None)
         in_features = model.classifier[1].in_features
@@ -376,7 +474,14 @@ def run_inference(image: Image.Image, model: nn.Module, device: torch.device):
 # SIDEBAR
 # ==========================================
 with st.sidebar:
-    st.markdown("### Spesifikasi Model")
+    st.markdown("""
+    <div style="font-size: 1.15rem; font-weight: 700; color: #F8FAFC; margin-bottom: 0.25rem;">
+        Spesifikasi Model
+    </div>
+    <div style="font-size: 0.8rem; color: #64748B; margin-bottom: 0.85rem;">
+        Konfigurasi & status inferensi
+    </div>
+    """, unsafe_allow_html=True)
 
     if len(AVAILABLE_MODELS) > 1:
         selected_model_label = st.selectbox(
@@ -397,11 +502,15 @@ with st.sidebar:
         model, device = None, None
 
     device_label = "CUDA" if (device and device.type == "cuda") else "CPU"
-    status_label = "Siap" if model else "Menunggu Checkpoint"
+    status_html = (
+        '<span class="spec-val-badge"><span class="status-dot"></span>Siap</span>'
+        if model else
+        '<span class="spec-val-badge-wait"><span class="status-dot-wait"></span>Menunggu</span>'
+    )
 
     st.markdown(f"""
-    <div style="margin-top: 0.5rem; margin-bottom: 1.5rem;">
-        <div class="spec-row"><span class="spec-key">Status</span><span class="spec-val">{status_label}</span></div>
+    <div class="sidebar-spec-card">
+        <div class="spec-row"><span class="spec-key">Status</span><span class="spec-val">{status_html}</span></div>
         <div class="spec-row"><span class="spec-key">Model</span><span class="spec-val">{active_cfg['name']}</span></div>
         <div class="spec-row"><span class="spec-key">Arsitektur</span><span class="spec-val">{active_cfg['arch_name']}</span></div>
         <div class="spec-row"><span class="spec-key">Parameter</span><span class="spec-val">{active_cfg['params']}</span></div>
@@ -409,8 +518,11 @@ with st.sidebar:
         <div class="spec-row"><span class="spec-key">Input Res</span><span class="spec-val">224 × 224 px</span></div>
         <div class="spec-row"><span class="spec-key">Batas File</span><span class="spec-val">Maks. {int(MAX_FILE_SIZE_MB)} MB</span></div>
     </div>
+    <div class="spec-desc-box">
+        <div class="spec-desc-label">Keterangan Model</div>
+        {active_cfg['desc']}
+    </div>
     """, unsafe_allow_html=True)
-    st.caption(active_cfg["desc"])
 
 
 # ==========================================
@@ -435,8 +547,8 @@ with col_upload:
     )
 
 with col_paste:
-    # Menggunakan st.iframe resmi tanpa warning deprecation
-    st.iframe("""
+    # Menggunakan components.html untuk menyisipkan HTML/JS paste & drop button
+    components.html("""
     <!DOCTYPE html>
     <html>
     <head>
@@ -637,28 +749,44 @@ if active_image is not None:
             st.error(f"File bobot model '{active_cfg['name']}' belum ditemukan. Silakan jalankan proses training di notebook terlebih dahulu.")
         else:
             pred_class, confidence, ai_prob, real_prob = run_inference(active_image, model, device)
-            is_ai = (pred_class == 0)
 
-            verdict_class = "verdict-ai" if is_ai else "verdict-real"
-            label_color = "label-ai" if is_ai else "label-real"
-            label_text = "AI-Generated" if is_ai else "Real Image"
+            # Kondisi threshold keyakinan 80%
+            if ai_prob >= 80.0:
+                verdict_class = "verdict-ai"
+                label_color = "label-ai"
+                verdict_title = "AI-Generated Image"
+                sub_status = "Tingkat Keyakinan Tinggi (AI ≥ 80%)"
+                badge_status = "AI-Generated"
+            elif real_prob >= 80.0:
+                verdict_class = "verdict-real"
+                label_color = "label-real"
+                verdict_title = "Real Image"
+                sub_status = "Tingkat Keyakinan Tinggi (Real ≥ 80%)"
+                badge_status = "Real Image"
+            else:
+                # Keyakinan di bawah 80%: terdeteksi sebagian diedit/dimodifikasi AI
+                verdict_class = "verdict-modified"
+                label_color = "label-modified"
+                verdict_title = "Gambar ini terdeteksi sebagian diedit atau dimodifikasi menggunakan kecerdasan buatan (AI)"
+                sub_status = "Tingkat Keyakinan Rendah (< 80%)"
+                badge_status = "Sebagian Diedit AI"
 
             st.markdown(f"""
             <div class="verdict-card {verdict_class}">
-                <div class="verdict-tag">Hasil Klasifikasi ({active_cfg['name']})</div>
-                <div class="verdict-label {label_color}">{label_text}</div>
+                <div class="verdict-tag">Hasil Klasifikasi ({active_cfg['name']}) • {sub_status}</div>
+                <div class="verdict-label {label_color}">{verdict_title}</div>
             </div>
             """, unsafe_allow_html=True)
 
             st.markdown(f"""
             <div class="stat-container">
                 <div class="stat-card">
-                    <div class="stat-title">Keyakinan Prediksi</div>
+                    <div class="stat-title">Tingkat Keyakinan</div>
                     <div class="stat-num">{confidence:.1f}%</div>
                 </div>
                 <div class="stat-card">
-                    <div class="stat-title">Kelas Terpilih</div>
-                    <div class="stat-num" style="font-size: 1.05rem; padding-top: 0.25rem;">{label_text}</div>
+                    <div class="stat-title">Status Deteksi</div>
+                    <div class="stat-num" style="font-size: 1.0rem; padding-top: 0.25rem;">{badge_status}</div>
                 </div>
             </div>
             """, unsafe_allow_html=True)
