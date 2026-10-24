@@ -8,6 +8,7 @@ import torch.nn as nn
 from torchvision import models, transforms
 from PIL import Image
 import streamlit as st
+import streamlit.components.v1 as components
 
 # Konfigurasi Halaman
 st.set_page_config(
@@ -435,8 +436,8 @@ with col_upload:
     )
 
 with col_paste:
-    # Menggunakan st.iframe resmi tanpa warning deprecation
-    st.iframe("""
+    # Menggunakan components.html untuk menyisipkan HTML/JS paste & drop button
+    components.html("""
     <!DOCTYPE html>
     <html>
     <head>
