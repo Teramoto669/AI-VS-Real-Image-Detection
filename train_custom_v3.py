@@ -125,7 +125,7 @@ def train_model(args):
     print(f"Output Path   : {args.output_path}")
     print("=" * 70)
 
-    # 1. Muat Dataset
+    # 1. Muat Dataset & Pembagian Stratified 80:10:10 (Train:Val:Test)
     print("\n📦 Memuat dataset dari cache...")
     raw_dataset = load_dataset(
         args.dataset_name,
@@ -133,17 +133,24 @@ def train_model(args):
         cache_dir=args.cache_dir,
         verification_mode="no_checks"
     )
-    splits = raw_dataset.train_test_split(test_size=0.10, stratify_by_column="label", seed=42)
-    train_hf = splits["train"]
-    val_hf = splits["test"]
+    # Langkah 1: Pisahkan 80% Train dan 20% sisa (Val + Test)
+    train_split = raw_dataset.train_test_split(test_size=0.20, stratify_by_column="label", seed=42)
+    train_hf = train_split["train"]  # 80%
+
+    # Langkah 2: Bagi 20% sisa secara merata menjadi 10% Val dan 10% Test
+    temp_split = train_split["test"].train_test_split(test_size=0.50, stratify_by_column="label", seed=42)
+    val_hf = temp_split["train"]     # 10%
+    test_hf = temp_split["test"]     # 10%
 
     print(f"Dataset Loaded : {len(raw_dataset):,} citra")
-    print(f"├─ Data Train  : {len(train_hf):,} citra (90%)")
-    print(f"└─ Data Validasi: {len(val_hf):,} citra (10%)")
+    print(f"├─ Data Train (80%)      : {len(train_hf):,} citra")
+    print(f"├─ Data Validasi (10%)   : {len(val_hf):,} citra (Tuning & Checkpoint)")
+    print(f"└─ Data Pengujian (10%)  : {len(test_hf):,} citra (Independent Test Set)")
 
     train_transforms, val_transforms = get_robust_forensic_transforms()
     train_ds = HFToPyTorchDataset(train_hf, transform=train_transforms)
     val_ds = HFToPyTorchDataset(val_hf, transform=val_transforms)
+    test_ds = HFToPyTorchDataset(test_hf, transform=val_transforms)
 
     use_pin = torch.cuda.is_available()
     train_loader = DataLoader(
@@ -152,6 +159,10 @@ def train_model(args):
     )
     val_loader = DataLoader(
         val_ds, batch_size=args.batch_size, shuffle=False,
+        num_workers=args.num_workers, pin_memory=use_pin
+    )
+    test_loader = DataLoader(
+        test_ds, batch_size=args.batch_size, shuffle=False,
         num_workers=args.num_workers, pin_memory=use_pin
     )
 
@@ -285,8 +296,8 @@ def train_model(args):
 
         print("-" * 70)
 
-    # 3. Evaluasi Akhir dengan Test-Time Augmentation (TTA)
-    print("\n🔍 Memuat bobot terbaik untuk Evaluasi Final...")
+    # 3. Evaluasi Akhir pada Independent Test Set (10%) dengan TTA
+    print("\n🔍 Memuat bobot terbaik untuk Evaluasi Final pada Independent Test Set (10%)...")
     model.load_state_dict(best_weights)
     model.eval()
 
@@ -295,7 +306,7 @@ def train_model(args):
     targets = []
 
     with torch.no_grad():
-        for images, labels in tqdm(val_loader, desc="Final TTA Evaluation"):
+        for images, labels in tqdm(test_loader, desc="Final Test Evaluation (TTA)"):
             images = images.to(device, non_blocking=True)
             images_flip = torch.flip(images, dims=[3])
 
