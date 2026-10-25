@@ -49,6 +49,28 @@ class RandomJPEGCompression:
         return img
 
 
+class RandomDownscaleJitter:
+    """
+    Simulasi downsampling acak (skala 0.6x - 1.0x) dengan interpolasi bervariasi.
+    Melatih model agar mengenali bahwa citra nyata yang sudah di-resize/dikompresi
+    oleh aplikasi perpesanan (WhatsApp, Telegram) tetaplah Real Image dan tidak salah
+    dideteksi sebagai AI akibat hilangnya sebagian noise sensor kamera.
+    """
+    def __init__(self, p=0.35, scale_range=(0.6, 1.0)):
+        self.p = p
+        self.scale_range = scale_range
+
+    def __call__(self, img):
+        if random.random() < self.p:
+            w, h = img.size
+            factor = random.uniform(*self.scale_range)
+            nw = max(224, int(round(w * factor)))
+            nh = max(224, int(round(h * factor)))
+            resample_mode = random.choice([Image.Resampling.BILINEAR, Image.Resampling.BICUBIC])
+            return img.resize((nw, nh), resample=resample_mode)
+        return img
+
+
 class NativeResolutionCrop:
     """
     Penyempurnaan Fundamental V4:
@@ -138,6 +160,7 @@ def get_v4_transforms(img_size=224):
     - Gaussian blur mikro dan Color Jitter sangat halus.
     """
     train_transforms = transforms.Compose([
+        RandomDownscaleJitter(p=0.35, scale_range=(0.6, 1.0)),
         RandomJPEGCompression(quality_range=(60, 95), p=0.45),
         NativeResolutionCrop(size=img_size, is_train=True),
         transforms.RandomHorizontalFlip(p=0.5),
