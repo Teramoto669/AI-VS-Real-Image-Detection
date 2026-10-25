@@ -355,7 +355,7 @@ MODELS_CONFIG = {
         "desc": "Arsitektur kustom generasi ke-3: Multi-Scale Static Filter Bank (12-ch) + Dual-Stream + Mean-Std Pooling.",
     },
     "AIForensicNet V4 (Tri-Stream SOTA)": {
-        "paths": ["best_aiforensicnet_v4_ai_vs_real.pth", "backup/best_aiforensicnet_v4_ai_vs_real.pth"],
+        "paths": ["best_aiforensicnet_v4_cf.pth", "best_aiforensicnet_v4_ai_vs_real.pth", "backup/best_aiforensicnet_v4_ai_vs_real.pth"],
         "arch": "aiforensicnet_v4",
         "name": "AIForensicNet V4",
         "arch_name": "Tri-Stream (NPR + 2D-FFT + RGB)",
