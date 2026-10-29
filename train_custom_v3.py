@@ -19,7 +19,7 @@ from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 from tqdm.auto import tqdm
 from sklearn.metrics import classification_report, f1_score, confusion_matrix
-from datasets import load_dataset
+from datasets import load_dataset, ClassLabel
 
 from model_custom import AIForensicNetV3
 
@@ -59,8 +59,8 @@ class HFToPyTorchDataset(Dataset):
 
     def __getitem__(self, idx):
         item = self.dataset[idx]
-        image = item["image"]
-        label = item["label"]
+        image = item.get("image", item.get("Image"))
+        label = int(item["label"])
 
         if image.mode == 'P' and 'transparency' in image.info:
             image = image.convert('RGBA')
@@ -125,27 +125,92 @@ def train_model(args):
     print(f"Output Path   : {args.output_path}")
     print("=" * 70)
 
-    # 1. Muat Dataset & Pembagian Stratified 80:10:10 (Train:Val:Test)
-    print("\n📦 Memuat dataset dari cache...")
-    raw_dataset = load_dataset(
-        args.dataset_name,
-        split="train",
-        cache_dir=args.cache_dir,
-        verification_mode="no_checks"
-    )
-    # Langkah 1: Pisahkan 80% Train dan 20% sisa (Val + Test)
-    train_split = raw_dataset.train_test_split(test_size=0.20, stratify_by_column="label", seed=42)
-    train_hf = train_split["train"]  # 80%
+    # 1. Muat Dataset dengan Split Resmi Defactify (Train: 42,000 | Validation: 9,000 | Test: 45,000)
+    print(f"\n📦 Memuat split resmi dataset '{args.dataset_name}' dari Hugging Face / cache...")
 
-    # Langkah 2: Bagi 20% sisa secara merata menjadi 10% Val dan 10% Test
-    temp_split = train_split["test"].train_test_split(test_size=0.50, stratify_by_column="label", seed=42)
-    val_hf = temp_split["train"]     # 10%
-    test_hf = temp_split["test"]     # 10%
+    def prepare_defactify_split(dataset_split):
+        """
+        Standarisasi format kolom dan mapping label untuk split dataset Defactify:
+        - Normalisasi nama kolom citra ('Image' -> 'image')
+        - Mapping label: Defactify Label_A (0=Real, 1=AI) -> Standar V3 (0=AI-Generated, 1=Real Image)
+        """
+        if "Label_A" in dataset_split.column_names:
+            dataset_split = dataset_split.map(
+                lambda b: {"label": [0 if int(x) == 1 else 1 for x in b["Label_A"]]},
+                batched=True
+            )
+            dataset_split = dataset_split.cast_column("label", ClassLabel(num_classes=2, names=["AI-Generated", "Real Image"]))
+        elif "label" in dataset_split.column_names and not isinstance(dataset_split.features.get("label"), ClassLabel):
+            dataset_split = dataset_split.cast_column("label", ClassLabel(num_classes=2, names=["AI-Generated", "Real Image"]))
 
-    print(f"Dataset Loaded : {len(raw_dataset):,} citra")
-    print(f"├─ Data Train (80%)      : {len(train_hf):,} citra")
-    print(f"├─ Data Validasi (10%)   : {len(val_hf):,} citra (Tuning & Checkpoint)")
-    print(f"└─ Data Pengujian (10%)  : {len(test_hf):,} citra (Independent Test Set)")
+        if "Image" in dataset_split.column_names and "image" not in dataset_split.column_names:
+            dataset_split = dataset_split.rename_column("Image", "image")
+
+        return dataset_split
+
+    try:
+        from datasets import get_dataset_split_names
+        available_splits = get_dataset_split_names(args.dataset_name)
+    except Exception:
+        available_splits = ["train", "validation", "test"]
+
+    if "validation" in available_splits and "test" in available_splits:
+        print("[*] Split resmi Defactify terdeteksi:")
+        print("    ├─ 'train'      : 42,000 citra (Rekomendasi untuk Model Training)")
+        print("    ├─ 'validation' :  9,000 citra (Rekomendasi untuk Hyperparameter Tuning & Early Stopping)")
+        print("    └─ 'test'       : 45,000 citra (Rekomendasi untuk Final Unbiased Benchmark Evaluation)")
+
+        train_hf = load_dataset(args.dataset_name, split="train", cache_dir=args.cache_dir, verification_mode="no_checks")
+        val_hf = load_dataset(args.dataset_name, split="validation", cache_dir=args.cache_dir, verification_mode="no_checks")
+        test_hf = load_dataset(args.dataset_name, split="test", cache_dir=args.cache_dir, verification_mode="no_checks")
+
+        train_hf = prepare_defactify_split(train_hf)
+        val_hf = prepare_defactify_split(val_hf)
+        test_hf = prepare_defactify_split(test_hf)
+
+        # Opsi subsampling jika pengguna menetapkan kuota sampel
+        if args.max_samples is not None and args.max_samples > 0:
+            total_available = len(train_hf) + len(val_hf) + len(test_hf)
+            if total_available > args.max_samples:
+                # Subsampling proporsional sesuai rasio resmi Defactify (42k : 9k : 45k)
+                ratio_train = len(train_hf) / total_available  # ~43.75%
+                ratio_val = len(val_hf) / total_available      # ~9.375%
+                n_train = max(10, int(args.max_samples * ratio_train))
+                n_val = max(5, int(args.max_samples * ratio_val))
+                n_test = max(10, args.max_samples - n_train - n_val)
+                print(f"[*] Subsampling proporsional resmi ({args.max_samples:,} total): Train={n_train:,}, Val={n_val:,}, Test={n_test:,}...")
+                train_hf = train_hf.shuffle(seed=42).select(range(min(n_train, len(train_hf))))
+                val_hf = val_hf.shuffle(seed=42).select(range(min(n_val, len(val_hf))))
+                test_hf = test_hf.shuffle(seed=42).select(range(min(n_test, len(test_hf))))
+        elif any([args.max_train_samples, args.max_val_samples, args.max_test_samples]):
+            if args.max_train_samples and len(train_hf) > args.max_train_samples:
+                print(f"[*] Subsampling train: {args.max_train_samples:,} citra...")
+                train_hf = train_hf.shuffle(seed=42).select(range(args.max_train_samples))
+            if args.max_val_samples and len(val_hf) > args.max_val_samples:
+                print(f"[*] Subsampling val: {args.max_val_samples:,} citra...")
+                val_hf = val_hf.shuffle(seed=42).select(range(args.max_val_samples))
+            if args.max_test_samples and len(test_hf) > args.max_test_samples:
+                print(f"[*] Subsampling test: {args.max_test_samples:,} citra...")
+                test_hf = test_hf.shuffle(seed=42).select(range(args.max_test_samples))
+    else:
+        # Fallback jika repositori kustom hanya menyediakan single split 'train'
+        raw_dataset = load_dataset(args.dataset_name, split="train", cache_dir=args.cache_dir, verification_mode="no_checks")
+        raw_dataset = prepare_defactify_split(raw_dataset)
+        if args.max_samples is not None and args.max_samples > 0 and len(raw_dataset) > args.max_samples:
+            raw_dataset = raw_dataset.shuffle(seed=42).select(range(args.max_samples))
+        train_split = raw_dataset.train_test_split(test_size=0.20, stratify_by_column="label", seed=42)
+        train_hf = train_split["train"]
+        temp_split = train_split["test"].train_test_split(test_size=0.50, stratify_by_column="label", seed=42)
+        val_hf = temp_split["train"]
+        test_hf = temp_split["test"]
+
+    print("=" * 70)
+    print("📊 DATASET DEFACTIFY TERKONFIGURASI (SPLIT RESMI):")
+    print(f"├─ Data Train (Resmi)     : {len(train_hf):,} citra (Model Training)")
+    print(f"├─ Data Validasi (Resmi)  : {len(val_hf):,} citra (Hyperparameter Tuning & Best Checkpoint)")
+    print(f"└─ Data Pengujian (Resmi) : {len(test_hf):,} citra (Independent Benchmark Evaluation)")
+    print("=" * 70)
+
 
     train_transforms, val_transforms = get_robust_forensic_transforms()
     train_ds = HFToPyTorchDataset(train_hf, transform=train_transforms)
@@ -180,8 +245,8 @@ def train_model(args):
 
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-2)
 
-    # Learning Rate Scheduler: Warmup 2 epoch + Cosine Annealing
-    warmup_epochs = min(2, args.epochs // 4)
+    # Learning Rate Scheduler: Warmup 3 Epoch + Cosine Annealing Terkalibrasi
+    warmup_epochs = min(3, max(1, args.epochs // 4))
     cosine_epochs = max(1, args.epochs - warmup_epochs)
 
     def lr_lambda(epoch):
@@ -194,8 +259,11 @@ def train_model(args):
     scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
     scaler = torch.amp.GradScaler("cuda", enabled=torch.cuda.is_available())
 
+    best_val_score = 0.0
     best_val_acc = 0.0
     best_val_f1 = 0.0
+    best_val_probs = []
+    best_val_labels = []
     best_weights = copy.deepcopy(model.state_dict())
 
     print("\n🏁 Memulai loop pelatihan...")
@@ -249,6 +317,7 @@ def train_model(args):
         val_loss = 0.0
         val_correct = 0
         val_total = 0
+        epoch_val_probs = []
         all_val_preds = []
         all_val_labels = []
 
@@ -264,10 +333,13 @@ def train_model(args):
                     loss = eval_criterion(outputs, labels)
 
                 val_loss += loss.item() * images.size(0)
-                _, preds = torch.max(outputs, 1)
+                probs = torch.softmax(outputs, dim=1)
+                _, preds = torch.max(probs, 1)
+
                 val_correct += torch.sum(preds == labels).item()
                 val_total += images.size(0)
 
+                epoch_val_probs.extend(probs[:, 1].cpu().numpy())  # Probabilitas kelas Real (1)
                 all_val_preds.extend(preds.cpu().numpy())
                 all_val_labels.extend(labels.cpu().numpy())
 
@@ -286,23 +358,47 @@ def train_model(args):
         print(f"   Val Loss  : {epoch_val_loss:.4f} | Val Acc  : {epoch_val_acc * 100:.2f}% | Val Macro F1: {epoch_val_f1:.4f}")
         print(f"   Durasi    : {elapsed_sec / 60:.2f} menit")
 
-        # Simpan checkpoint terbaik
-        if epoch_val_acc > best_val_acc:
+        # Checkpoint selection berdasarkan skor terbobot Macro F1 (70%) + Akurasi (30%)
+        # Mencegah bias akurasi semu akibat dataset tidak seimbang (5:1)
+        val_score = 0.70 * epoch_val_f1 + 0.30 * epoch_val_acc
+        if val_score > best_val_score:
+            best_val_score = val_score
             best_val_acc = epoch_val_acc
             best_val_f1 = epoch_val_f1
+            best_val_probs = copy.deepcopy(epoch_val_probs)
+            best_val_labels = copy.deepcopy(all_val_labels)
             best_weights = copy.deepcopy(model.state_dict())
-            torch.save(best_weights, args.output_path)
-            print(f"   🌟 CHECKPOINT TERBAIK DIPERBARUI! Disimpan ke: '{args.output_path}'")
+            torch.save({
+                "model_state_dict": best_weights,
+                "val_acc": best_val_acc,
+                "val_f1": best_val_f1,
+                "epoch": epoch + 1
+            }, args.output_path)
+            print(f"   🌟 CHECKPOINT TERBAIK DIPERBARUI! (Val F1: {epoch_val_f1*100:.2f}%, Acc: {epoch_val_acc*100:.2f}%) -> '{args.output_path}'")
 
         print("-" * 70)
 
-    # 3. Evaluasi Akhir pada Independent Test Set (10%) dengan TTA
-    print("\n🔍 Memuat bobot terbaik untuk Evaluasi Final pada Independent Test Set (10%)...")
+    # 3. Pencarian Threshold Keputusan Optimal dari Set Validasi
+    print("\n🎯 Menghitung Threshold Kalibrasi Optimal pada Set Validasi...")
+    best_threshold = 0.50
+    best_th_f1 = best_val_f1
+    if len(best_val_probs) > 0 and len(best_val_labels) > 0:
+        for th in np.arange(0.30, 0.70, 0.02):
+            th_preds = (np.array(best_val_probs) >= th).astype(int)
+            th_f1 = f1_score(best_val_labels, th_preds, average='macro')
+            if th_f1 > best_th_f1:
+                best_th_f1 = th_f1
+                best_threshold = float(th)
+
+    print(f"   Threshold Standar     : 0.50 (Macro F1: {best_val_f1*100:.2f}%)")
+    print(f"   Threshold Terkalibrasi : {best_threshold:.2f} (Macro F1: {best_th_f1*100:.2f}%)")
+
+    # 4. Evaluasi Akhir pada Independent Test Set Resmi Defactify dengan TTA
+    print(f"\n🔍 Memuat bobot terbaik untuk Evaluasi Final pada Test Set Resmi Defactify ({len(test_ds):,} citra)...")
     model.load_state_dict(best_weights)
     model.eval()
 
-    preds_std = []
-    preds_tta = []
+    probs_real_tta = []
     targets = []
 
     with torch.no_grad():
@@ -318,33 +414,57 @@ def train_model(args):
             prob_flip = torch.softmax(out_flip, dim=1)
             prob_tta = (prob_std + prob_flip) / 2.0
 
-            _, p_s = torch.max(prob_std, 1)
-            _, p_t = torch.max(prob_tta, 1)
-
-            preds_std.extend(p_s.cpu().numpy())
-            preds_tta.extend(p_t.cpu().numpy())
+            probs_real_tta.extend(prob_tta[:, 1].cpu().numpy())
             targets.extend(labels.numpy())
 
-    acc_std = (np.array(preds_std) == np.array(targets)).mean() * 100.0
-    acc_tta = (np.array(preds_tta) == np.array(targets)).mean() * 100.0
+    probs_real_tta = np.array(probs_real_tta)
+    targets = np.array(targets)
+
+    # Prediksi Standar (Threshold 0.50)
+    preds_std = (probs_real_tta >= 0.50).astype(int)
+    acc_std = (preds_std == targets).mean() * 100.0
+    f1_std = f1_score(targets, preds_std, average='macro') * 100.0
+
+    # Prediksi Terkalibrasi (Threshold Optimal)
+    preds_cal = (probs_real_tta >= best_threshold).astype(int)
+    acc_cal = (preds_cal == targets).mean() * 100.0
+    f1_cal = f1_score(targets, preds_cal, average='macro') * 100.0
 
     print("\n" + "=" * 70)
-    print("🏆 HASIL AKHIR PELATIHAN AIForensicNet V3:")
-    print(f"Akurasi Standar : {acc_std:.2f}%")
-    print(f"Akurasi TTA     : {acc_tta:.2f}% (Peningkatan: {acc_tta - acc_std:+.2f}%)")
+    print("🏆 HASIL AKHIR PELATIHAN AIForensicNet V3 (Official Defactify Test Set):")
+    print(f"├─ Evaluasi Standar (Threshold 0.50)   : Akurasi = {acc_std:.2f}%, Macro F1 = {f1_std:.2f}%")
+    print(f"└─ Evaluasi Terkalibrasi (Th {best_threshold:.2f}) : Akurasi = {acc_cal:.2f}%, Macro F1 = {f1_cal:.2f}% (Peningkatan: {f1_cal - f1_std:+.2f}%)")
     print("=" * 70)
-    print("\nCLASSIFICATION REPORT (AIForensicNet V3 + TTA):")
-    print(classification_report(targets, preds_tta, target_names=["AI-Generated (0)", "Real Image (1)"], digits=4))
+
+    print("\nCLASSIFICATION REPORT (AIForensicNet V3 - Standard Threshold 0.50):")
+    print(classification_report(targets, preds_std, target_names=["AI-Generated (0)", "Real Image (1)"], digits=4))
+
+    print("\nCLASSIFICATION REPORT (AIForensicNet V3 - Calibrated Optimal Threshold):")
+    print(classification_report(targets, preds_cal, target_names=["AI-Generated (0)", "Real Image (1)"], digits=4))
+
+    # Perbarui file checkpoint dengan metadata threshold
+    torch.save({
+        "model_state_dict": best_weights,
+        "val_acc": best_val_acc,
+        "val_f1": best_val_f1,
+        "best_threshold": best_threshold,
+        "test_acc_std": acc_std,
+        "test_acc_cal": acc_cal
+    }, args.output_path)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Pelatihan Teroptimasi AIForensicNet V3")
-    parser.add_argument("--dataset-name", type=str, default="Thunderbeast/AI-Generated-vs-Real-Images-Datasets")
+    parser = argparse.ArgumentParser(description="Pelatihan Teroptimasi AIForensicNet V3 (Defactify Official Splits)")
+    parser.add_argument("--dataset-name", type=str, default="Rajarshi-Roy-research/Defactify_Image_Dataset", help="HuggingFace dataset repository (default: Rajarshi-Roy-research/Defactify_Image_Dataset)")
     parser.add_argument("--cache-dir", type=str, default="./data")
+    parser.add_argument("--max-samples", type=int, default=None, help="Batas maksimal total sampel (dibagi proporsional ke train/val/test resmi Defactify)")
+    parser.add_argument("--max-train-samples", type=int, default=None, help="Batas maksimal sampel train resmi Defactify (opsional)")
+    parser.add_argument("--max-val-samples", type=int, default=None, help="Batas maksimal sampel validation resmi Defactify (opsional)")
+    parser.add_argument("--max-test-samples", type=int, default=None, help="Batas maksimal sampel test resmi Defactify (opsional)")
     parser.add_argument("--epochs", type=int, default=15)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--accum-steps", type=int, default=1)
-    parser.add_argument("--lr", type=float, default=5e-4)
+    parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate awal (default: 3e-4 untuk stabilitas maksimal)")
     parser.add_argument("--dropout", type=float, default=0.25)
     parser.add_argument("--label-smoothing", type=float, default=0.05)
     parser.add_argument("--num-workers", type=int, default=0)
@@ -352,3 +472,5 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
     train_model(args)
+
+

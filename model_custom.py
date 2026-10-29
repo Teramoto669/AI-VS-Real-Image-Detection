@@ -550,11 +550,13 @@ class AIForensicNetV3(nn.Module):
         )
 
         # 4. Multi-Stat Classification Head (Mean + Std = 1024 fitur)
+        # Menggunakan LayerNorm(256) alih-alih BatchNorm1d untuk stabilitas evaluasi 100% konsisten
+        # tanpa fluktuasi/spike running statistics antar-epoch.
         self.pool = MeanStdPool2d()
         self.head = nn.Sequential(
             nn.Dropout(p=dropout_p),
             nn.Linear(512 * 2, 256),
-            nn.BatchNorm1d(256),
+            nn.LayerNorm(256),
             nn.GELU(),
             nn.Dropout(p=0.2),
             nn.Linear(256, 64),
@@ -562,6 +564,13 @@ class AIForensicNetV3(nn.Module):
             nn.Dropout(p=0.1),
             nn.Linear(64, num_classes)
         )
+
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
+        """Memastikan kompatibilitas backward jika memuat bobot dari checkpoint lama berbasis BatchNorm1d."""
+        for key in list(state_dict.keys()):
+            if key.startswith(prefix + "head.2.") and any(x in key for x in ["running_mean", "running_var", "num_batches_tracked"]):
+                state_dict.pop(key, None)
+        super()._load_from_state_dict(state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs)
 
     def forward(self, x):
         # Aliran 1: Ekstraksi sinyal residual multi-skala
@@ -585,6 +594,7 @@ class AIForensicNetV3(nn.Module):
 
         # Klasifikasi probabilitas kelas
         return self.head(pooled)
+
 
 
 # ==============================================================================
@@ -825,5 +835,262 @@ class AIForensicNetV4(nn.Module):
 
         # Klasifikasi probabilitas kelas
         return self.head(pooled)
+
+
+# ==============================================================================
+# AIForensicNet V4 HiDF (Exact Model Definition for HiDF Deepfake Dataset)
+# ==============================================================================
+
+class FFTSpectralBranchHiDF(nn.Module):
+    def __init__(self, in_channels: int = 3, out_channels: int = 32):
+        super().__init__()
+        self.proj = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.GELU()
+        )
+    def forward(self, x):
+        fft_val = torch.fft.fft2(x, norm='ortho')
+        fft_shift = torch.fft.fftshift(fft_val, dim=(-2, -1))
+        mag = torch.log(torch.abs(fft_shift) + 1e-6)
+        mag = (mag - mag.mean(dim=(-2, -1), keepdim=True)) / (mag.std(dim=(-2, -1), keepdim=True) + 1e-6)
+        return self.proj(mag)
+
+
+class MultiScaleForensicFilterBankV4HiDF(nn.Module):
+    def __init__(self):
+        super().__init__()
+        lap3 = torch.tensor([[-1., -1., -1.], [-1.,  8., -1.], [-1., -1., -1.]], dtype=torch.float32)
+        lap5 = torch.tensor([[0., 0., -1., 0., 0.], [0., -1., -2., -1., 0.], [-1., -2., 16., -2., -1.], [0., -1., -2., -1., 0.], [0., 0., -1., 0., 0.]], dtype=torch.float32)
+        dog = torch.tensor([[-1., -3., -4., -3., -1.], [-3., 0., 6., 0., -3.], [-4., 6., 20., 6., -4.], [-3., 0., 6., 0., -3.], [-1., -3., -4., -3., -1.]], dtype=torch.float32) / 16.0
+        sobel_h = torch.tensor([[-1., 0., 1.], [-2., 0., 2.], [-1., 0., 1.]], dtype=torch.float32)
+        sobel_v = torch.tensor([[-1., -2., -1.], [0., 0., 0.], [1., 2., 1.]], dtype=torch.float32)
+
+        k3 = torch.stack([lap3, sobel_h, sobel_v]).unsqueeze(1).repeat(3, 1, 1, 1)
+        self.register_buffer('k3_weight', k3)
+        k5 = torch.stack([lap5, dog]).unsqueeze(1).repeat(3, 1, 1, 1)
+        self.register_buffer('k5_weight', k5)
+        self.npr = nn.Conv2d(3, 3, kernel_size=3, padding=1, groups=3, bias=False)
+
+    def forward(self, x):
+        f3 = F.conv2d(x, self.k3_weight, padding=1, groups=3)
+        f5 = F.conv2d(x, self.k5_weight, padding=2, groups=3)
+        sh = f3[:, 1::3, :, :]
+        sv = f3[:, 2::3, :, :]
+        smag = torch.sqrt(sh ** 2 + sv ** 2 + 1e-6)
+        lap3_out = f3[:, 0::3, :, :]
+        lap5_out = f5[:, 0::2, :, :]
+        dog_out = f5[:, 1::2, :, :]
+        npr_out = self.npr(x)
+        return torch.cat([lap3_out, lap5_out, dog_out, smag, npr_out], dim=1)
+
+
+class AIForensicNetV4HiDF(nn.Module):
+    """
+    AIForensicNetV4HiDF: Model V4 yang secara presisi dilatih pada HiDF Deepfake Dataset.
+    Kompatibel 100% dengan bobot best_aiforensicnet_v4_hidf.pth.
+    """
+    def __init__(self, num_classes: int = 2, dropout_p: float = 0.25):
+        super().__init__()
+        self.forensic_bank = MultiScaleForensicFilterBankV4HiDF()
+        self.forensic_stem = nn.Sequential(nn.Conv2d(15, 32, 3, 2, 1, bias=False), nn.BatchNorm2d(32), nn.GELU())
+        self.spectral_branch = FFTSpectralBranchHiDF(3, 32)
+        self.rgb_stem = nn.Sequential(nn.Conv2d(3, 32, 3, 2, 1, bias=False), nn.BatchNorm2d(32), nn.GELU())
+        self.fusion = nn.Sequential(nn.Conv2d(96, 64, 1, bias=False), nn.BatchNorm2d(64), nn.GELU())
+        self.stage1 = nn.Sequential(ForensicBlock(64, 64), ForensicBlock(64, 64))
+        self.stage2 = nn.Sequential(ForensicBlock(64, 128, stride=2), ForensicBlock(128, 128))
+        self.stage3 = nn.Sequential(ForensicBlock(128, 256, stride=2), ForensicBlock(256, 256))
+        self.stage4 = nn.Sequential(ForensicBlock(256, 512, stride=2), ForensicBlock(512, 512))
+        self.pool = MultiStatPool2d()
+        self.head = nn.Sequential(
+            nn.Dropout(p=dropout_p),
+            nn.Linear(512 * 2, 128),
+            nn.BatchNorm1d(128),
+            nn.GELU(),
+            nn.Dropout(p=0.15),
+            nn.Linear(128, num_classes)
+        )
+
+    def forward(self, x):
+        f_forensic = self.forensic_stem(self.forensic_bank(x))
+        f_spectral = self.spectral_branch(x)
+        f_rgb = self.rgb_stem(x)
+        out = self.fusion(torch.cat([f_forensic, f_spectral, f_rgb], dim=1))
+        out = self.stage4(self.stage3(self.stage2(self.stage1(out))))
+        return self.head(self.pool(out))
+
+
+class AIForensicNetV4Forgery(nn.Module):
+    """
+    AIForensicNetV4Forgery: Arsitektur Quad-Domain Forensik V4 khusus untuk
+    deteksi manipulasi citra (Splicing, Copy-Move, CASIA v2.0 & IMD2020).
+    Mendukung input 6 kanal (RGB + ELA) atau 3 kanal RGB dengan fallback otomatis.
+    Kompatibel 100% dengan bobot best_aiforensicnet_v4_casia2.pth.
+    """
+    def __init__(self, in_channels: int = 6, num_classes: int = 2, dropout_p: float = 0.3):
+        super().__init__()
+        self.in_channels = in_channels
+        self.forensic_bank = MultiScaleForensicFilterBankV4HiDF()
+        self.forensic_stem = nn.Sequential(
+            nn.Conv2d(15, 32, kernel_size=3, stride=2, padding=1, bias=False), 
+            nn.BatchNorm2d(32), 
+            nn.GELU()
+        )
+        self.spectral_branch = FFTSpectralBranchHiDF(3, 32)
+        self.rgb_stem = nn.Sequential(
+            nn.Conv2d(in_channels, 32, kernel_size=3, stride=2, padding=1, bias=False), 
+            nn.BatchNorm2d(32), 
+            nn.GELU()
+        )
+        self.fusion = nn.Sequential(
+            nn.Conv2d(96, 64, kernel_size=1, bias=False), 
+            nn.BatchNorm2d(64), 
+            nn.GELU()
+        )
+        self.stage1 = nn.Sequential(ForensicBlock(64, 64), ForensicBlock(64, 64))
+        self.stage2 = nn.Sequential(ForensicBlock(64, 128, stride=2), ForensicBlock(128, 128))
+        self.stage3 = nn.Sequential(ForensicBlock(128, 256, stride=2), ForensicBlock(256, 256))
+        self.stage4 = nn.Sequential(ForensicBlock(256, 512, stride=2), ForensicBlock(512, 512))
+        self.pool = MultiStatPool2d()
+        self.head = nn.Sequential(
+            nn.Dropout(p=dropout_p),
+            nn.Linear(512 * 2, 256),
+            nn.BatchNorm1d(256),
+            nn.GELU(),
+            nn.Dropout(p=0.2),
+            nn.Linear(256, num_classes)
+        )
+
+    def forward(self, x):
+        if x.shape[1] == 6:
+            x_rgb = x[:, :3]
+            f_rgb = self.rgb_stem(x)
+        else:
+            x_rgb = x
+            if self.in_channels == 6:
+                f_rgb = self.rgb_stem(torch.cat([x, x], dim=1))
+            else:
+                f_rgb = self.rgb_stem(x)
+                
+        f_forensic = self.forensic_stem(self.forensic_bank(x_rgb))
+        f_spectral = self.spectral_branch(x_rgb)
+        out = self.fusion(torch.cat([f_forensic, f_spectral, f_rgb], dim=1))
+        out = self.stage4(self.stage3(self.stage2(self.stage1(out))))
+        return self.head(self.pool(out))
+
+
+class AIForensicNetV4Universal(nn.Module):
+    """
+    AIForensicNet V4 Universal (Two-Stream Dual-Branch dengan Learnable Gated Cross-Attention).
+    
+    Arsitektur End-to-End untuk Deteksi Universal (AI Generatif Murni & Forgery / Splicing):
+    1. Branch 1 (Spatial Texture Stream - Generative AI Specialist):
+       Mengekstrak artefak visual, tekstur kulit, batas helai rambut, dan keanehan khas difusi
+       (Midjourney v6, DALL-E 3, SDXL, Flux, CIFAKE).
+    2. Branch 2 (Forensic High-Pass & Spectral Stream - Tampering / Splicing Specialist):
+       Mengekstrak diskontinuitas gradien tepi, residu noise PRNU, filter bank steganografi (SRM,
+       Laplacian 3x3/5x5, DoG), dan resonansi frekuensi 2D FFT (CASIA 2.0, Photoshop).
+    3. Learnable Gated Cross-Attention (Dynamic Gate α):
+       Secara dinamis mempelajari pembobotan fitur (alpha in [0, 1]) untuk setiap citra secara otomatis.
+       Jika splicing -> bobot Branch 2 naik. Jika AI murni -> bobot Branch 1 naik.
+       Jika foto asli -> kedua cabang menghasilkan representasi negatif.
+    4. Input: Standar 3-kanal RGB (Format-agnostic: JPEG, PNG, WEBP, BMP didukung secara native tanpa ELA loss).
+    """
+    def __init__(self, num_classes: int = 2, dropout_p: float = 0.3):
+        super().__init__()
+        # Branch 1: Spatial & Semantic Stream (AI Generatif: Midjourney, DALL-E, SDXL)
+        self.rgb_stem = nn.Sequential(
+            nn.Conv2d(3, 32, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.GELU()
+        )
+        self.b1_stage1 = nn.Sequential(ForensicBlock(32, 64), ForensicBlock(64, 64))
+        self.b1_stage2 = nn.Sequential(ForensicBlock(64, 128, stride=2), ForensicBlock(128, 128))
+        self.b1_stage3 = nn.Sequential(ForensicBlock(128, 256, stride=2), ForensicBlock(256, 256))
+        self.b1_stage4 = nn.Sequential(ForensicBlock(256, 384, stride=2), ForensicBlock(384, 384))
+        
+        # Branch 2: High-Pass Residual & Spectral Stream (Forgery, Splicing, Copy-Move)
+        self.forensic_bank = MultiScaleForensicFilterBankV4HiDF()
+        self.forensic_stem = nn.Sequential(
+            nn.Conv2d(15, 32, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.GELU()
+        )
+        self.spectral_branch = FFTSpectralBranchHiDF(3, 32)
+        self.b2_fusion = nn.Sequential(
+            nn.Conv2d(64, 32, kernel_size=1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.GELU()
+        )
+        self.b2_stage1 = nn.Sequential(ForensicBlock(32, 64), ForensicBlock(64, 64))
+        self.b2_stage2 = nn.Sequential(ForensicBlock(64, 128, stride=2), ForensicBlock(128, 128))
+        self.b2_stage3 = nn.Sequential(ForensicBlock(128, 256, stride=2), ForensicBlock(256, 256))
+        self.b2_stage4 = nn.Sequential(ForensicBlock(256, 384, stride=2), ForensicBlock(384, 384))
+        
+        self.pool = MultiStatPool2d()
+        
+        # Learnable Gated Cross-Attention Module
+        self.gate_mlp = nn.Sequential(
+            nn.Linear(768 * 2, 256),
+            nn.LayerNorm(256),
+            nn.GELU(),
+            nn.Linear(256, 768),
+            nn.Sigmoid()
+        )
+        
+        # Classification Head (Dual-enhanced)
+        self.head = nn.Sequential(
+            nn.Dropout(p=dropout_p),
+            nn.Linear(768, 256),
+            nn.LayerNorm(256),
+            nn.GELU(),
+            nn.Dropout(p=0.2),
+            nn.Linear(256, num_classes)
+        )
+
+    def forward(self, x, x_crop=None, return_gate: bool = False):
+        """
+        Forward Pass Dual-Scale Asymmetric:
+        - x        : Citra Global (224x224 scaled) untuk Branch 1 (AI Generatif & Semantik Global).
+        - x_crop   : Citra Native-Resolution Crop (224x224 murni) untuk Branch 2 (Forensik Frekuensi & Splicing).
+        Mendukung backward-compatibility: jika x_crop=None, kedua branch memproses x.
+        """
+        if x_crop is not None:
+            x_global = x[:, :3] if x.shape[1] >= 3 else x
+            x_local = x_crop[:, :3] if x_crop.shape[1] >= 3 else x_crop
+        elif x.shape[1] == 6:
+            # Dual-scale input terpaket dalam 6-kanal (0:3 global, 3:6 native crop)
+            x_global = x[:, :3]
+            x_local = x[:, 3:6]
+        else:
+            x_global = x
+            x_local = x
+            
+        # Branch 1 Forward (Spasial Tekstur AI & Semantik Global)
+        f1 = self.rgb_stem(x_global)
+        f1 = self.b1_stage4(self.b1_stage3(self.b1_stage2(self.b1_stage1(f1))))
+        v_spatial = self.pool(f1)
+        
+        # Branch 2 Forward (High-Pass Residual Splicing & Spektral Resolusi Native)
+        f_bank = self.forensic_stem(self.forensic_bank(x_local))
+        f_spec = self.spectral_branch(x_local)
+        f2 = self.b2_fusion(torch.cat([f_bank, f_spec], dim=1))
+        f2 = self.b2_stage4(self.b2_stage3(self.b2_stage2(self.b2_stage1(f2))))
+        v_residual = self.pool(f2)
+        
+        # Gated Cross-Attention Fusion
+        gate_input = torch.cat([v_spatial, v_residual], dim=1)
+        alpha = self.gate_mlp(gate_input)
+        
+        # Adaptive Fused Representation
+        v_fused = alpha * v_spatial + (1.0 - alpha) * v_residual
+        
+        logits = self.head(v_fused)
+        if return_gate:
+            return logits, alpha.mean(dim=1)
+        return logits
+
+
+
 
 

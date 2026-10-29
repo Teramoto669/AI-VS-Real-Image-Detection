@@ -355,12 +355,28 @@ MODELS_CONFIG = {
         "desc": "Arsitektur kustom generasi ke-3: Multi-Scale Static Filter Bank (12-ch) + Dual-Stream + Mean-Std Pooling.",
     },
     "AIForensicNet V4 (Tri-Stream SOTA)": {
-        "paths": ["best_aiforensicnet_v4_cf.pth", "best_aiforensicnet_v4_ai_vs_real.pth", "backup/best_aiforensicnet_v4_ai_vs_real.pth"],
+        "paths": ["best_aiforensicnet_v4_ai_vs_real.pth", "backup/best_aiforensicnet_v4_ai_vs_real.pth"],
         "arch": "aiforensicnet_v4",
         "name": "AIForensicNet V4",
         "arch_name": "Tri-Stream (NPR + 2D-FFT + RGB)",
         "params": "2.93 Juta (From Scratch)",
         "desc": "Arsitektur kustom generasi ke-4: Tri-Stream (15-ch Multi-Scale + NPR + 2D Spectral FFT) + Multi-Stat Pooling.",
+    },
+    "AIForensicNet V4 (CommunityForensics)": {
+        "paths": ["best_aiforensicnet_v4_cf.pth", "backup/best_aiforensicnet_v4_cf.pth"],
+        "arch": "aiforensicnet_v4",
+        "name": "AIForensicNet V4 (CF)",
+        "arch_name": "Tri-Stream (CVPR 2025 Benchmark)",
+        "params": "2.93 Juta (From Scratch)",
+        "desc": "AIForensicNet V4 yang dilatih khusus pada dataset OwensLab/CommunityForensics (4.800+ AI Generators).",
+    },
+    "AIForensicNet V4 Universal": {
+        "paths": ["best_aiforensicnet_v4_universal.pth", "backup/best_aiforensicnet_v4_universal.pth"],
+        "arch": "aiforensicnet_v4_universal",
+        "name": "AIForensicNet V4 Universal",
+        "arch_name": "Tri-Stream Universal (AI + DEFACTO)",
+        "params": "2.93 Juta (From Scratch)",
+        "desc": "Arsitektur V4 Universal untuk deteksi AI Generatif (CommunityForensics) & Manipulasi Spasial (DEFACTO Copy-Move, Splicing, Inpainting).",
     },
 }
 
@@ -375,11 +391,14 @@ for label, cfg in MODELS_CONFIG.items():
 
 @st.cache_resource(show_spinner=False)
 def get_model(model_path: str, arch: str):
-    """Memuat model secara dinamis (DINOv2-Small, ConvNeXt-Tiny, EfficientNetV2-S, atau AIForensicNet V1-V4)."""
+    """Memuat model secara dinamis (DINOv2-Small, ConvNeXt-Tiny, EfficientNetV2-S, atau AIForensicNet V1-V4 & Universal)."""
     if not os.path.exists(model_path):
         return None, None
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    raw_ckpt = torch.load(model_path, map_location=device, weights_only=False)
+    state_dict = raw_ckpt["model_state_dict"] if isinstance(raw_ckpt, dict) and "model_state_dict" in raw_ckpt else raw_ckpt
+    is_dual_universal = False
 
     if arch == "dinov2_vits14":
         class DINOv2AppClassifier(nn.Module):
@@ -426,9 +445,14 @@ def get_model(model_path: str, arch: str):
     elif arch == "aiforensicnet_v3":
         from model_custom import AIForensicNetV3
         model = AIForensicNetV3(num_classes=2)
-    elif arch == "aiforensicnet_v4":
-        from model_custom import AIForensicNetV4
-        model = AIForensicNetV4(num_classes=2)
+    elif arch in ("aiforensicnet_v4", "aiforensicnet_v4_universal"):
+        if "b1_stage1.0.dwconv.weight" in state_dict:
+            from model_custom import AIForensicNetV4Universal
+            model = AIForensicNetV4Universal(num_classes=2)
+            is_dual_universal = True
+        else:
+            from model_custom import AIForensicNetV4
+            model = AIForensicNetV4(num_classes=2)
     else:
         model = models.efficientnet_b0(weights=None)
         in_features = model.classifier[1].in_features
@@ -437,12 +461,23 @@ def get_model(model_path: str, arch: str):
             nn.Linear(in_features, 2)
         )
 
-    state_dict = torch.load(model_path, map_location=device, weights_only=False)
     model.load_state_dict(state_dict)
+    model._is_dual_universal = is_dual_universal
     model = model.to(device)
     model.eval()
 
     return model, device
+
+
+def _native_center_crop(img: Image.Image, size: int = 224) -> Image.Image:
+    w, h = img.size
+    if w < size or h < size:
+        scale = max(size / w, size / h)
+        img = img.resize((int(round(w * scale)), int(round(h * scale))), Image.Resampling.BILINEAR)
+        w, h = img.size
+    left = (w - size) // 2
+    top = (h - size) // 2
+    return img.crop((left, top, left + size, top + size))
 
 
 def run_inference(image: Image.Image, model: nn.Module, device: torch.device):
@@ -457,6 +492,26 @@ def run_inference(image: Image.Image, model: nn.Module, device: torch.device):
     tensor_img_flipped = torch.flip(tensor_img, dims=[3])
 
     with torch.no_grad():
+        if getattr(model, "_is_dual_universal", False):
+            norm_only = transforms.Compose([
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            ])
+            crop_img = _native_center_crop(rgb_image, size=224)
+            tensor_crop = norm_only(crop_img).unsqueeze(0).to(device)
+            tensor_crop_flipped = torch.flip(tensor_crop, dims=[3])
+            outputs_orig = model(tensor_img, x_crop=tensor_crop)
+            outputs_flip = model(tensor_img_flipped, x_crop=tensor_crop_flipped)
+            probs_orig = torch.softmax(outputs_orig, dim=1)[0]
+            probs_flip = torch.softmax(outputs_flip, dim=1)[0]
+            probs = (probs_orig + probs_flip) / 2.0
+            # Pada checkpoint Universal Dual-Branch: 0 = Real, 1 = Fake/AI
+            real_prob = probs[0].item() * 100.0
+            ai_prob = probs[1].item() * 100.0
+            predicted_idx = 0 if ai_prob >= real_prob else 1
+            confidence = max(ai_prob, real_prob)
+            return predicted_idx, confidence, ai_prob, real_prob
+
         outputs_orig = model(tensor_img)
         outputs_flip = model(tensor_img_flipped)
         probs_orig = torch.softmax(outputs_orig, dim=1)[0]
