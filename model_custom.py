@@ -1094,3 +1094,247 @@ class AIForensicNetV4Universal(nn.Module):
 
 
 
+
+class AIForensicNetV4HybridTL(nn.Module):
+    """
+    AIForensicNetV4HybridTL: Model Buatan (Custom Forensic Stream) + Transfer Learning (Pretrained ConvNeXt-Tiny).
+    """
+    def __init__(self, num_classes: int = 2, pretrained: bool = True, dropout_p: float = 0.3):
+        super().__init__()
+        from torchvision import models
+        weights = models.ConvNeXt_Tiny_Weights.DEFAULT if pretrained else None
+        backbone = models.convnext_tiny(weights=weights)
+        self.tl_features = backbone.features
+        self.tl_avgpool = backbone.avgpool
+        self.tl_norm = backbone.classifier[0]
+
+        self.forensic_bank = MultiScaleForensicFilterBankV4()
+        self.forensic_stem = nn.Sequential(nn.Conv2d(15, 32, 3, stride=2, padding=1, bias=False), nn.BatchNorm2d(32), nn.GELU())
+        self.spectral_branch = FFTSpectralBranch(3, 32)
+        self.custom_fusion = nn.Sequential(nn.Conv2d(64, 64, 1, bias=False), nn.BatchNorm2d(64), nn.GELU())
+        self.c_stage1 = nn.Sequential(ForensicBlock(64, 64), ForensicBlock(64, 64))
+        self.c_stage2 = nn.Sequential(ForensicBlock(64, 128, stride=2), ForensicBlock(128, 128))
+        self.c_stage3 = nn.Sequential(ForensicBlock(128, 256, stride=2), ForensicBlock(256, 256))
+        self.c_pool = MultiStatPool2d()
+
+        self.proj_tl = nn.Sequential(nn.Linear(768, 512), nn.LayerNorm(512), nn.GELU())
+        self.proj_custom = nn.Sequential(nn.Linear(512, 512), nn.LayerNorm(512), nn.GELU())
+        self.gate = nn.Sequential(nn.Linear(1024, 512), nn.Sigmoid())
+        self.head = nn.Sequential(
+            nn.Dropout(p=dropout_p), nn.Linear(512, 128),
+            nn.BatchNorm1d(128), nn.GELU(), nn.Dropout(p=0.15), nn.Linear(128, num_classes)
+        )
+
+    def forward(self, x):
+        f_tl = self.tl_norm(self.tl_avgpool(self.tl_features(x))).flatten(1)
+        v_tl = self.proj_tl(f_tl)
+        f_c = self.custom_fusion(torch.cat([self.forensic_stem(self.forensic_bank(x)), self.spectral_branch(x)], dim=1))
+        f_c = self.c_stage3(self.c_stage2(self.c_stage1(f_c)))
+        v_c = self.proj_custom(self.c_pool(f_c))
+        g = self.gate(torch.cat([v_tl, v_c], dim=1))
+        return self.head(g * v_tl + (1.0 - g) * v_c)
+
+
+# ==============================================================================
+# Clean-Slate Recommendation: Spatial-Variance & Anomaly-Aware Forensic Net
+# ==============================================================================
+
+class LayerNorm2dClean(nn.Module):
+    """LayerNorm2d (B, C, H, W) tanpa mencampur statistik antar-citra di dalam batch."""
+    def __init__(self, channels: int, eps: float = 1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(channels))
+        self.bias = nn.Parameter(torch.zeros(channels))
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        u = x.mean(1, keepdim=True)
+        s = (x - u).pow(2).mean(1, keepdim=True)
+        return self.weight[:, None, None] * ((x - u) / torch.sqrt(s + self.eps)) + self.bias[:, None, None]
+
+
+class ZeroMeanConv2d(nn.Module):
+    """Constrained Conv2d (sum of weights = 0, center = -1) untuk menekan konten objek & mengekstrak noise."""
+    def __init__(self, in_c: int = 3, out_c: int = 9, kernel_size: int = 5):
+        super().__init__()
+        self.padding = kernel_size // 2
+        self.c = kernel_size // 2
+        self.weight = nn.Parameter(torch.randn(out_c, in_c, kernel_size, kernel_size))
+        nn.init.xavier_uniform_(self.weight)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        mask = torch.ones_like(self.weight)
+        mask[:, :, self.c, self.c] = 0.0
+        w_masked = self.weight * mask
+        w_norm = w_masked / (w_masked.sum(dim=(2, 3), keepdim=True) + 1e-7)
+        center = torch.zeros_like(self.weight)
+        center[:, :, self.c, self.c] = 1.0
+        return F.conv2d(x, w_norm * mask - center, padding=self.padding)
+
+
+class PhaseMagSpectralStem(nn.Module):
+    """Mengekstrak Log-Magnitude DAN Phase Spectrum 2D-FFT (peka terhadap kerusakan fase inpainting)."""
+    def __init__(self, in_c: int = 3, out_c: int = 32):
+        super().__init__()
+        self.proj = nn.Sequential(
+            nn.Conv2d(in_c * 2, out_c, kernel_size=3, stride=2, padding=1, bias=False),
+            LayerNorm2dClean(out_c),
+            nn.GELU()
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        fft = torch.fft.fft2(x.float(), norm='ortho')
+        fft_shift = torch.fft.fftshift(fft, dim=(-2, -1))
+        mag = torch.log1p(torch.abs(fft_shift))
+        phase = torch.angle(fft_shift) / 3.14159265
+        spec = torch.cat([mag, phase], dim=1).to(x.dtype)
+        return self.proj(spec)
+
+
+class MixKernelForensicBlock(nn.Module):
+    """
+    Dual-Receptive Field Block (Mix-Kernel 3x3 + 7x7 Depthwise + LayerNorm2d + SE):
+    - 3x3 menangkap batas tepi jahitan (seam boundary) inpainting yang tajam.
+    - 7x7 menangkap pola periodik upsampling difusi/GAN.
+    """
+    def __init__(self, in_c: int, out_c: int, stride: int = 1):
+        super().__init__()
+        self.dw3 = nn.Conv2d(in_c, in_c, kernel_size=3, stride=stride, padding=1, groups=in_c, bias=False)
+        self.dw7 = nn.Conv2d(in_c, in_c, kernel_size=7, stride=stride, padding=3, groups=in_c, bias=False)
+        self.norm = LayerNorm2dClean(in_c)
+        self.pw1 = nn.Conv2d(in_c, out_c * 2, kernel_size=1)
+        self.act = nn.GELU()
+        self.pw2 = nn.Conv2d(out_c * 2, out_c, kernel_size=1)
+        self.se = SqueezeExcitation(out_c)
+        self.shortcut = nn.Sequential(
+            nn.Conv2d(in_c, out_c, kernel_size=1, stride=stride, bias=False),
+            LayerNorm2dClean(out_c)
+        ) if stride != 1 or in_c != out_c else nn.Identity()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        feat = self.norm(self.dw3(x) + self.dw7(x))
+        feat = self.se(self.pw2(self.act(self.pw1(feat))))
+        return feat + self.shortcut(x)
+
+
+class IntraImageInconsistencyAttention(nn.Module):
+    """
+    Mendeteksi patch/area yang 'berbeda sendiri' (anomali inpainting lokal) terhadap rata-rata
+    karakteristik noise latar belakang di dalam gambar yang sama.
+    """
+    def __init__(self, channels: int):
+        super().__init__()
+        self.gate = nn.Sequential(
+            nn.Conv2d(channels, channels // 4, kernel_size=1),
+            LayerNorm2dClean(channels // 4),
+            nn.GELU(),
+            nn.Conv2d(channels // 4, 1, kernel_size=1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Selisih fitur lokal terhadap rata-rata fitur global di dalam gambar yang sama
+        global_mean = x.mean(dim=(2, 3), keepdim=True)
+        diff = torch.abs(x - global_mean)
+        attn = self.gate(diff)
+        return x * (1.0 + attn)
+
+
+class TopKAnomalyPool2d(nn.Module):
+    """
+    Menggabungkan Mean + Std + Top-K (15%) Spatial Activation Pooling.
+    Mencegah sinyal inpainting lokal (5%-20% area gambar) tenggelam oleh rata-rata area asli.
+    """
+    def __init__(self, topk_ratio: float = 0.15):
+        super().__init__()
+        self.topk_ratio = topk_ratio
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, c, h, w = x.shape
+        n = h * w
+        k = max(1, int(round(n * self.topk_ratio)))
+        flat = x.view(b, c, n)
+        mean = flat.mean(dim=-1)
+        std = torch.sqrt(flat.var(dim=-1, unbiased=False) + 1e-6)
+        topk_vals, _ = torch.topk(flat, k=k, dim=-1)
+        topk_mean = topk_vals.mean(dim=-1)
+        return torch.cat([mean, std, topk_mean], dim=1)
+
+
+class AnomalyForensicNet(nn.Module):
+    """
+    Rekomendasi Clean-Slate From-Scratch untuk CommunityForensics + DEFACTO Inpainting:
+    1. Hybrid Forensic Stem: Fixed 15-ch Filter Bank (SRM/Lap/DoG/NPR) + 9-ch Zero-Mean Conv + Phase/Mag 2D-FFT.
+    2. 4-Stage Mix-Kernel (3x3 + 7x7) Backbone dengan LayerNorm2d.
+    3. Intra-Image Inconsistency Attention (menyorot tambalan inpainting yang menyimpang dari background).
+    4. Dual-Task Output:
+       - Top-K (15%) + Mean + Std Pooling -> Klasifikasi (0: AI/Inpainted, 1: Real)
+       - Auxiliary 14x14 Anomaly Heatmap -> Lokalisasi area manipulasi/inpainting.
+    """
+    def __init__(self, num_classes: int = 2, dropout_p: float = 0.3):
+        super().__init__()
+        # Stem 1: Fixed 15-ch + Learnable Zero-Mean 9-ch = 24-ch Forensic Residual
+        self.fixed_bank = MultiScaleForensicFilterBankV4()
+        self.zeromean_conv = ZeroMeanConv2d(3, 9, kernel_size=5)
+        self.forensic_stem = nn.Sequential(
+            nn.Conv2d(24, 32, kernel_size=3, stride=2, padding=1, bias=False),
+            LayerNorm2dClean(32),
+            nn.GELU()
+        )
+        # Stem 2: Phase + Magnitude 2D-FFT (6-ch -> 32-ch)
+        self.spectral_stem = PhaseMagSpectralStem(in_c=3, out_c=32)
+        # Stem 3: Spatial Context (3-ch -> 32-ch)
+        self.rgb_stem = nn.Sequential(
+            nn.Conv2d(3, 32, kernel_size=3, stride=2, padding=1, bias=False),
+            LayerNorm2dClean(32),
+            nn.GELU()
+        )
+        self.fusion = nn.Sequential(
+            nn.Conv2d(96, 64, kernel_size=1, bias=False),
+            LayerNorm2dClean(64),
+            nn.GELU()
+        )
+
+        # 4-Stage Mix-Kernel (3x3 + 7x7) Backbone
+        self.stage1 = nn.Sequential(MixKernelForensicBlock(64, 64), MixKernelForensicBlock(64, 64))
+        self.stage2 = nn.Sequential(MixKernelForensicBlock(64, 128, stride=2), MixKernelForensicBlock(128, 128))
+        self.stage3 = nn.Sequential(MixKernelForensicBlock(128, 256, stride=2), MixKernelForensicBlock(256, 256))
+        self.stage4 = nn.Sequential(MixKernelForensicBlock(256, 384, stride=2), MixKernelForensicBlock(384, 384))
+
+        # Intra-Image Patch Inconsistency Attention pada resolusi 14x14
+        self.inconsistency_attn = IntraImageInconsistencyAttention(384)
+
+        # Auxiliary Anomaly Localization Head (Peta 14x14: 1 = Fake/Inpainted, 0 = Real)
+        self.mask_head = nn.Sequential(
+            nn.Conv2d(384, 64, kernel_size=3, padding=1, bias=False),
+            LayerNorm2dClean(64),
+            nn.GELU(),
+            nn.Conv2d(64, 1, kernel_size=1)
+        )
+
+        # Top-K (15%) + Mean + Std Pooling (384 * 3 = 1152-D)
+        self.pool = TopKAnomalyPool2d(topk_ratio=0.15)
+        self.head = nn.Sequential(
+            nn.Dropout(p=dropout_p),
+            nn.Linear(384 * 3, 192),
+            nn.LayerNorm(192),
+            nn.GELU(),
+            nn.Dropout(p=0.15),
+            nn.Linear(192, num_classes)
+        )
+
+    def forward(self, x: torch.Tensor, return_mask: bool = False):
+        res_24 = torch.cat([self.fixed_bank(x), self.zeromean_conv(x)], dim=1)
+        f_for = self.forensic_stem(res_24)
+        f_spec = self.spectral_stem(x)
+        f_rgb = self.rgb_stem(x)
+
+        feat = self.fusion(torch.cat([f_for, f_spec, f_rgb], dim=1))
+        feat = self.stage4(self.stage3(self.stage2(self.stage1(feat))))
+        feat = self.inconsistency_attn(feat)
+
+        logits = self.head(self.pool(feat))
+        if return_mask:
+            mask_logits = self.mask_head(feat)  # (B, 1, 14, 14)
+            return logits, mask_logits
+        return logits

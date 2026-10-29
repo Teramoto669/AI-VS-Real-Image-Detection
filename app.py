@@ -398,7 +398,6 @@ def get_model(model_path: str, arch: str):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     raw_ckpt = torch.load(model_path, map_location=device, weights_only=False)
     state_dict = raw_ckpt["model_state_dict"] if isinstance(raw_ckpt, dict) and "model_state_dict" in raw_ckpt else raw_ckpt
-    is_dual_universal = False
 
     if arch == "dinov2_vits14":
         class DINOv2AppClassifier(nn.Module):
@@ -446,13 +445,8 @@ def get_model(model_path: str, arch: str):
         from model_custom import AIForensicNetV3
         model = AIForensicNetV3(num_classes=2)
     elif arch in ("aiforensicnet_v4", "aiforensicnet_v4_universal"):
-        if "b1_stage1.0.dwconv.weight" in state_dict:
-            from model_custom import AIForensicNetV4Universal
-            model = AIForensicNetV4Universal(num_classes=2)
-            is_dual_universal = True
-        else:
-            from model_custom import AIForensicNetV4
-            model = AIForensicNetV4(num_classes=2)
+        from model_custom import AIForensicNetV4
+        model = AIForensicNetV4(num_classes=2)
     else:
         model = models.efficientnet_b0(weights=None)
         in_features = model.classifier[1].in_features
@@ -462,30 +456,18 @@ def get_model(model_path: str, arch: str):
         )
 
     model.load_state_dict(state_dict)
-    model._is_dual_universal = is_dual_universal
     model = model.to(device)
     model.eval()
 
     return model, device
 
 
-def _native_center_crop(img: Image.Image, size: int = 224) -> Image.Image:
-    w, h = img.size
-    if w < size or h < size:
-        scale = max(size / w, size / h)
-        img = img.resize((int(round(w * scale)), int(round(h * scale))), Image.Resampling.BILINEAR)
-        w, h = img.size
-    left = (w - size) // 2
-    top = (h - size) // 2
-    return img.crop((left, top, left + size, top + size))
-
-
 def run_inference(image: Image.Image, model: nn.Module, device: torch.device, arch: str = ""):
     """
     Menjalankan inferensi cerdas adaptif berdasarkan karakteristik arsitektur:
-    - Untuk model forensik (AIForensicNet V2, V3, V4, Universal): Menggunakan Multi-Crop Native Resolution TTA
-      (Center Crop + 4 Corner Crops + Global Resized Context + Flip) untuk menjaga kestabilan
-      frekuensi tinggi dan noise sensor kamera asli tanpa terdistorsi downsampling.
+    - Untuk model forensik (AIForensicNet V2, V3, V4, Universal): Menggunakan 5-Crop Native Resolution TTA
+      (Center Crop + 4 Corner Crops + Flip) murni 1:1 tanpa downsampling agar jejak frekuensi tinggi
+      dan noise PRNU sensor kamera asli tidak terdistorsi interpolasi bilinear.
     - Untuk model semantik (DINOv2, ConvNeXt, EfficientNet): Menggunakan Global Resized TTA.
     """
     if image.mode == 'P' and 'transparency' in image.info:
@@ -497,25 +479,6 @@ def run_inference(image: Image.Image, model: nn.Module, device: torch.device, ar
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
-
-    if getattr(model, "_is_dual_universal", False):
-        tensor_img = transform_pipeline(rgb_image).unsqueeze(0).to(device)
-        tensor_img_flipped = torch.flip(tensor_img, dims=[3])
-        crop_img = _native_center_crop(rgb_image, size=224)
-        tensor_crop = norm_transform(crop_img).unsqueeze(0).to(device)
-        tensor_crop_flipped = torch.flip(tensor_crop, dims=[3])
-        with torch.no_grad():
-            outputs_orig = model(tensor_img, x_crop=tensor_crop)
-            outputs_flip = model(tensor_img_flipped, x_crop=tensor_crop_flipped)
-            probs_orig = torch.softmax(outputs_orig, dim=1)[0]
-            probs_flip = torch.softmax(outputs_flip, dim=1)[0]
-            probs = (probs_orig + probs_flip) / 2.0
-        # Pada checkpoint Universal Dual-Branch: 0 = Real, 1 = Fake/AI
-        real_prob = probs[0].item() * 100.0
-        ai_prob = probs[1].item() * 100.0
-        predicted_idx = 0 if ai_prob >= real_prob else 1
-        confidence = max(ai_prob, real_prob)
-        return predicted_idx, confidence, ai_prob, real_prob
 
     if arch in ["aiforensicnet_v2", "aiforensicnet_v3", "aiforensicnet_v4", "aiforensicnet_v4_universal"]:
         crop_size = 224
@@ -536,7 +499,6 @@ def run_inference(image: Image.Image, model: nn.Module, device: torch.device, ar
             proc_img.crop((pw - crop_size, 0, pw, crop_size)),       # Top-Right
             proc_img.crop((0, ph - crop_size, crop_size, ph)),       # Bottom-Left
             proc_img.crop((pw - crop_size, ph - crop_size, pw, ph)), # Bottom-Right
-            rgb_image.resize((crop_size, crop_size), Image.Resampling.BILINEAR), # Global layout context
         ]
 
         tensor_list = []
@@ -550,7 +512,14 @@ def run_inference(image: Image.Image, model: nn.Module, device: torch.device, ar
         with torch.no_grad():
             outputs = model(batch_tensors)
             probs = torch.softmax(outputs, dim=1)
-            mean_probs = probs.mean(dim=0)
+            patch_probs = probs.view(len(patches), 2, 2).mean(dim=1) # (5, 2)
+            if arch == "aiforensicnet_v4_universal":
+                # Kombinasi Mean + Top-2 Patch untuk menangkap manipulasi lokal (Splicing/Copy-Move/Inpainting)
+                top2_ai = torch.topk(patch_probs[:, 0], k=2).values.mean()
+                ai_score = 0.5 * patch_probs[:, 0].mean() + 0.5 * top2_ai
+                mean_probs = torch.stack([ai_score, 1.0 - ai_score])
+            else:
+                mean_probs = patch_probs.mean(dim=0)
             confidence, predicted_idx = torch.max(mean_probs, 0)
 
         ai_prob = mean_probs[0].item() * 100.0
@@ -861,6 +830,10 @@ if active_image is not None:
                 active_image, model, device, arch=active_cfg.get("arch", "")
             )
 
+            is_univ = active_cfg.get("arch") == "aiforensicnet_v4_universal"
+            fake_title = "AI-Generated / Manipulated Image" if is_univ else "AI-Generated Image"
+            fake_short = "AI / Manipulasi" if is_univ else "AI"
+
             # Logika threshold cerdas & terkalibrasi:
             # - Keyakinan Tinggi (>= 80%)
             # - Keyakinan Sedang (>= 60%)
@@ -868,9 +841,9 @@ if active_image is not None:
             if ai_prob >= 80.0:
                 verdict_class = "verdict-ai"
                 label_color = "label-ai"
-                verdict_title = "AI-Generated Image"
-                sub_status = f"Tingkat Keyakinan Tinggi (AI: {ai_prob:.1f}%)"
-                badge_status = "AI-Generated"
+                verdict_title = fake_title
+                sub_status = f"Tingkat Keyakinan Tinggi ({fake_short}: {ai_prob:.1f}%)"
+                badge_status = "AI / Manipulated" if is_univ else "AI-Generated"
             elif real_prob >= 80.0:
                 verdict_class = "verdict-real"
                 label_color = "label-real"
@@ -880,9 +853,9 @@ if active_image is not None:
             elif ai_prob >= 60.0:
                 verdict_class = "verdict-ai"
                 label_color = "label-ai"
-                verdict_title = "AI-Generated Image"
-                sub_status = f"Tingkat Keyakinan Sedang (AI: {ai_prob:.1f}%)"
-                badge_status = "Cenderung AI"
+                verdict_title = fake_title
+                sub_status = f"Tingkat Keyakinan Sedang ({fake_short}: {ai_prob:.1f}%)"
+                badge_status = "Cenderung Manipulasi" if is_univ else "Cenderung AI"
             elif real_prob >= 60.0:
                 verdict_class = "verdict-real"
                 label_color = "label-real"
@@ -893,9 +866,9 @@ if active_image is not None:
                 # Keyakinan di rentang ambigu (40% - 59.9%): terdeteksi sebagian diedit/dimodifikasi AI
                 verdict_class = "verdict-modified"
                 label_color = "label-modified"
-                verdict_title = "Gambar ini terdeteksi sebagian diedit atau dimodifikasi menggunakan kecerdasan buatan (AI)"
-                sub_status = f"Tingkat Keyakinan Rendah / Ambigu (AI: {ai_prob:.1f}% vs Real: {real_prob:.1f}%)"
-                badge_status = "Sebagian Diedit AI"
+                verdict_title = "Gambar ini terdeteksi sebagian diedit atau dimodifikasi (AI / Splicing / Inpainting)"
+                sub_status = f"Tingkat Keyakinan Rendah / Ambigu ({fake_short}: {ai_prob:.1f}% vs Real: {real_prob:.1f}%)"
+                badge_status = "Sebagian Diedit"
 
             st.markdown(f"""
             <div class="verdict-card {verdict_class}">
@@ -919,7 +892,7 @@ if active_image is not None:
 
             st.caption("Distribusi Probabilitas")
 
-            st.write(f"AI-Generated: **{ai_prob:.1f}%**")
+            st.write(f"{'AI / Manipulated' if is_univ else 'AI-Generated'}: **{ai_prob:.1f}%**")
             st.progress(ai_prob / 100.0)
 
             st.write(f"Real Image: **{real_prob:.1f}%**")
