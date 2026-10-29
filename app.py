@@ -354,21 +354,21 @@ MODELS_CONFIG = {
         "params": "3.07 Juta (From Scratch)",
         "desc": "Arsitektur kustom generasi ke-3: Multi-Scale Static Filter Bank (12-ch) + Dual-Stream + Mean-Std Pooling.",
     },
-    "AIForensicNet V4 (Tri-Stream SOTA)": {
-        "paths": ["best_aiforensicnet_v4_ai_vs_real.pth", "backup/best_aiforensicnet_v4_ai_vs_real.pth"],
-        "arch": "aiforensicnet_v4",
-        "name": "AIForensicNet V4",
-        "arch_name": "Tri-Stream (NPR + 2D-FFT + RGB)",
-        "params": "2.93 Juta (From Scratch)",
-        "desc": "Arsitektur kustom generasi ke-4: Tri-Stream (15-ch Multi-Scale + NPR + 2D Spectral FFT) + Multi-Stat Pooling.",
-    },
     "AIForensicNet V4 (CommunityForensics)": {
         "paths": ["best_aiforensicnet_v4_cf.pth", "backup/best_aiforensicnet_v4_cf.pth"],
         "arch": "aiforensicnet_v4",
         "name": "AIForensicNet V4 (CF)",
-        "arch_name": "Tri-Stream (CVPR 2025 Benchmark)",
-        "params": "2.93 Juta (From Scratch)",
-        "desc": "AIForensicNet V4 yang dilatih khusus pada dataset OwensLab/CommunityForensics (4.800+ AI Generators).",
+        "arch_name": "Tri-Stream (NPR + 2D-FFT + RGB)",
+        "params": "2.93 Juta (OwensLab/CommunityForensics)",
+        "desc": "Arsitektur kustom generasi ke-4 dilatih pada dataset SOTA CommunityForensics (CVPR 2025) dengan Multi-Crop Native Resolution.",
+    },
+    "AIForensicNet V4 (Thunderbeast)": {
+        "paths": ["best_aiforensicnet_v4_ai_vs_real.pth", "backup/best_aiforensicnet_v4_ai_vs_real.pth"],
+        "arch": "aiforensicnet_v4",
+        "name": "AIForensicNet V4 (TB)",
+        "arch_name": "Tri-Stream (NPR + 2D-FFT + RGB)",
+        "params": "2.93 Juta (Thunderbeast Dataset)",
+        "desc": "Arsitektur kustom generasi ke-4 dilatih pada dataset Thunderbeast dengan Multi-Crop Native Resolution.",
     },
     "AIForensicNet V4 Universal": {
         "paths": ["best_aiforensicnet_v4_universal.pth", "backup/best_aiforensicnet_v4_universal.pth"],
@@ -480,47 +480,95 @@ def _native_center_crop(img: Image.Image, size: int = 224) -> Image.Image:
     return img.crop((left, top, left + size, top + size))
 
 
-def run_inference(image: Image.Image, model: nn.Module, device: torch.device):
+def run_inference(image: Image.Image, model: nn.Module, device: torch.device, arch: str = ""):
     """
-    Menjalankan inferensi dengan Test-Time Augmentation (TTA: Original + Horizontal Flip)
-    untuk memaksimalkan stabilitas dan akurasi prediksi.
+    Menjalankan inferensi cerdas adaptif berdasarkan karakteristik arsitektur:
+    - Untuk model forensik (AIForensicNet V2, V3, V4, Universal): Menggunakan Multi-Crop Native Resolution TTA
+      (Center Crop + 4 Corner Crops + Global Resized Context + Flip) untuk menjaga kestabilan
+      frekuensi tinggi dan noise sensor kamera asli tanpa terdistorsi downsampling.
+    - Untuk model semantik (DINOv2, ConvNeXt, EfficientNet): Menggunakan Global Resized TTA.
     """
     if image.mode == 'P' and 'transparency' in image.info:
         image = image.convert('RGBA')
     rgb_image = image.convert("RGB")
-    tensor_img = transform_pipeline(rgb_image).unsqueeze(0).to(device)
-    tensor_img_flipped = torch.flip(tensor_img, dims=[3])
+    w, h = rgb_image.size
 
-    with torch.no_grad():
-        if getattr(model, "_is_dual_universal", False):
-            norm_only = transforms.Compose([
-                transforms.ToTensor(),
-                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-            ])
-            crop_img = _native_center_crop(rgb_image, size=224)
-            tensor_crop = norm_only(crop_img).unsqueeze(0).to(device)
-            tensor_crop_flipped = torch.flip(tensor_crop, dims=[3])
+    norm_transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
+
+    if getattr(model, "_is_dual_universal", False):
+        tensor_img = transform_pipeline(rgb_image).unsqueeze(0).to(device)
+        tensor_img_flipped = torch.flip(tensor_img, dims=[3])
+        crop_img = _native_center_crop(rgb_image, size=224)
+        tensor_crop = norm_transform(crop_img).unsqueeze(0).to(device)
+        tensor_crop_flipped = torch.flip(tensor_crop, dims=[3])
+        with torch.no_grad():
             outputs_orig = model(tensor_img, x_crop=tensor_crop)
             outputs_flip = model(tensor_img_flipped, x_crop=tensor_crop_flipped)
             probs_orig = torch.softmax(outputs_orig, dim=1)[0]
             probs_flip = torch.softmax(outputs_flip, dim=1)[0]
             probs = (probs_orig + probs_flip) / 2.0
-            # Pada checkpoint Universal Dual-Branch: 0 = Real, 1 = Fake/AI
-            real_prob = probs[0].item() * 100.0
-            ai_prob = probs[1].item() * 100.0
-            predicted_idx = 0 if ai_prob >= real_prob else 1
-            confidence = max(ai_prob, real_prob)
-            return predicted_idx, confidence, ai_prob, real_prob
+        # Pada checkpoint Universal Dual-Branch: 0 = Real, 1 = Fake/AI
+        real_prob = probs[0].item() * 100.0
+        ai_prob = probs[1].item() * 100.0
+        predicted_idx = 0 if ai_prob >= real_prob else 1
+        confidence = max(ai_prob, real_prob)
+        return predicted_idx, confidence, ai_prob, real_prob
 
-        outputs_orig = model(tensor_img)
-        outputs_flip = model(tensor_img_flipped)
-        probs_orig = torch.softmax(outputs_orig, dim=1)[0]
-        probs_flip = torch.softmax(outputs_flip, dim=1)[0]
-        probs = (probs_orig + probs_flip) / 2.0
-        confidence, predicted_idx = torch.max(probs, 0)
+    if arch in ["aiforensicnet_v2", "aiforensicnet_v3", "aiforensicnet_v4", "aiforensicnet_v4_universal"]:
+        crop_size = 224
+        # Pastikan dimensi minimal memenuhi ukuran crop
+        if min(w, h) < crop_size:
+            scale = float(crop_size) / float(min(w, h))
+            proc_img = rgb_image.resize((int(round(w * scale)), int(round(h * scale))), Image.Resampling.BILINEAR)
+            pw, ph = proc_img.size
+        else:
+            proc_img = rgb_image
+            pw, ph = w, h
 
-    ai_prob = probs[0].item() * 100.0
-    real_prob = probs[1].item() * 100.0
+        # 5 Patch resolusi native 1:1 menjaga jejak noise PRNU sensor kamera
+        cx, cy = (pw - crop_size) // 2, (ph - crop_size) // 2
+        patches = [
+            proc_img.crop((cx, cy, cx + crop_size, cy + crop_size)), # Center
+            proc_img.crop((0, 0, crop_size, crop_size)),             # Top-Left
+            proc_img.crop((pw - crop_size, 0, pw, crop_size)),       # Top-Right
+            proc_img.crop((0, ph - crop_size, crop_size, ph)),       # Bottom-Left
+            proc_img.crop((pw - crop_size, ph - crop_size, pw, ph)), # Bottom-Right
+            rgb_image.resize((crop_size, crop_size), Image.Resampling.BILINEAR), # Global layout context
+        ]
+
+        tensor_list = []
+        for p in patches:
+            t = norm_transform(p)
+            tensor_list.append(t)
+            tensor_list.append(torch.flip(t, dims=[2])) # horizontal flip TTA
+
+        batch_tensors = torch.stack(tensor_list).to(device)
+
+        with torch.no_grad():
+            outputs = model(batch_tensors)
+            probs = torch.softmax(outputs, dim=1)
+            mean_probs = probs.mean(dim=0)
+            confidence, predicted_idx = torch.max(mean_probs, 0)
+
+        ai_prob = mean_probs[0].item() * 100.0
+        real_prob = mean_probs[1].item() * 100.0
+    else:
+        tensor_img = transform_pipeline(rgb_image).unsqueeze(0).to(device)
+        tensor_img_flipped = torch.flip(tensor_img, dims=[3])
+
+        with torch.no_grad():
+            outputs_orig = model(tensor_img)
+            outputs_flip = model(tensor_img_flipped)
+            probs_orig = torch.softmax(outputs_orig, dim=1)[0]
+            probs_flip = torch.softmax(outputs_flip, dim=1)[0]
+            probs = (probs_orig + probs_flip) / 2.0
+            confidence, predicted_idx = torch.max(probs, 0)
+
+        ai_prob = probs[0].item() * 100.0
+        real_prob = probs[1].item() * 100.0
 
     return predicted_idx.item(), confidence.item() * 100.0, ai_prob, real_prob
 
@@ -562,6 +610,11 @@ with st.sidebar:
         if model else
         '<span class="spec-val-badge-wait"><span class="status-dot-wait"></span>Menunggu</span>'
     )
+    eval_mode_label = (
+        "Multi-Crop Native TTA"
+        if active_cfg.get("arch", "") in ["aiforensicnet_v2", "aiforensicnet_v3", "aiforensicnet_v4", "aiforensicnet_v4_universal"]
+        else "Global Resized TTA"
+    )
 
     st.markdown(f"""
     <div class="sidebar-spec-card">
@@ -570,6 +623,7 @@ with st.sidebar:
         <div class="spec-row"><span class="spec-key">Arsitektur</span><span class="spec-val">{active_cfg['arch_name']}</span></div>
         <div class="spec-row"><span class="spec-key">Parameter</span><span class="spec-val">{active_cfg['params']}</span></div>
         <div class="spec-row"><span class="spec-key">Perangkat</span><span class="spec-val">{device_label}</span></div>
+        <div class="spec-row"><span class="spec-key">Mode Evaluasi</span><span class="spec-val">{eval_mode_label}</span></div>
         <div class="spec-row"><span class="spec-key">Input Res</span><span class="spec-val">224 × 224 px</span></div>
         <div class="spec-row"><span class="spec-key">Batas File</span><span class="spec-val">Maks. {int(MAX_FILE_SIZE_MB)} MB</span></div>
     </div>
@@ -803,27 +857,44 @@ if active_image is not None:
         if model is None:
             st.error(f"File bobot model '{active_cfg['name']}' belum ditemukan. Silakan jalankan proses training di notebook terlebih dahulu.")
         else:
-            pred_class, confidence, ai_prob, real_prob = run_inference(active_image, model, device)
+            pred_class, confidence, ai_prob, real_prob = run_inference(
+                active_image, model, device, arch=active_cfg.get("arch", "")
+            )
 
-            # Kondisi threshold keyakinan 80%
+            # Logika threshold cerdas & terkalibrasi:
+            # - Keyakinan Tinggi (>= 80%)
+            # - Keyakinan Sedang (>= 60%)
+            # - Daerah Ambigu / Modifikasi Parsial (40% - 59.9%)
             if ai_prob >= 80.0:
                 verdict_class = "verdict-ai"
                 label_color = "label-ai"
                 verdict_title = "AI-Generated Image"
-                sub_status = "Tingkat Keyakinan Tinggi (AI ≥ 80%)"
+                sub_status = f"Tingkat Keyakinan Tinggi (AI: {ai_prob:.1f}%)"
                 badge_status = "AI-Generated"
             elif real_prob >= 80.0:
                 verdict_class = "verdict-real"
                 label_color = "label-real"
                 verdict_title = "Real Image"
-                sub_status = "Tingkat Keyakinan Tinggi (Real ≥ 80%)"
+                sub_status = f"Tingkat Keyakinan Tinggi (Real: {real_prob:.1f}%)"
                 badge_status = "Real Image"
+            elif ai_prob >= 60.0:
+                verdict_class = "verdict-ai"
+                label_color = "label-ai"
+                verdict_title = "AI-Generated Image"
+                sub_status = f"Tingkat Keyakinan Sedang (AI: {ai_prob:.1f}%)"
+                badge_status = "Cenderung AI"
+            elif real_prob >= 60.0:
+                verdict_class = "verdict-real"
+                label_color = "label-real"
+                verdict_title = "Real Image"
+                sub_status = f"Tingkat Keyakinan Sedang (Real: {real_prob:.1f}%)"
+                badge_status = "Cenderung Real"
             else:
-                # Keyakinan di bawah 80%: terdeteksi sebagian diedit/dimodifikasi AI
+                # Keyakinan di rentang ambigu (40% - 59.9%): terdeteksi sebagian diedit/dimodifikasi AI
                 verdict_class = "verdict-modified"
                 label_color = "label-modified"
                 verdict_title = "Gambar ini terdeteksi sebagian diedit atau dimodifikasi menggunakan kecerdasan buatan (AI)"
-                sub_status = "Tingkat Keyakinan Rendah (< 80%)"
+                sub_status = f"Tingkat Keyakinan Rendah / Ambigu (AI: {ai_prob:.1f}% vs Real: {real_prob:.1f}%)"
                 badge_status = "Sebagian Diedit AI"
 
             st.markdown(f"""
