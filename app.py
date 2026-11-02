@@ -378,6 +378,22 @@ MODELS_CONFIG = {
         "params": "2.93 Juta (From Scratch)",
         "desc": "Arsitektur V4 Universal untuk deteksi AI Generatif (CommunityForensics) & Manipulasi Spasial (DEFACTO Copy-Move, Splicing, Inpainting).",
     },
+    "AnomalyForensicNet (CF + Inpainting)": {
+        "paths": ["best_anomaly_forensicnet_cf_inpainting.pth", "backup/best_anomaly_forensicnet_cf_inpainting.pth"],
+        "arch": "anomaly_forensicnet",
+        "name": "AnomalyForensicNet",
+        "arch_name": "Mix-Kernel Anomaly-Aware (From Scratch)",
+        "params": "2.47 Juta (From Scratch)",
+        "desc": "Arsitektur kustom from-scratch khusus inpainting: Zero-Mean Conv + Phase/Mag FFT + Mix-Kernel 3x3/7x7 + Inconsistency Attn + Top-K Pooling.",
+    },
+    "AnomalyForensicNet TL (CF + Inpainting)": {
+        "paths": ["best_anomaly_forensicnet_tl_cf_inpainting.pth", "backup/best_anomaly_forensicnet_tl_cf_inpainting.pth"],
+        "arch": "anomaly_forensicnet_tl",
+        "name": "AnomalyForensicNet TL",
+        "arch_name": "Hybrid AnomalyForensicNet + ConvNeXt-Tiny",
+        "params": "28.9 Juta (Hybrid Transfer Learning)",
+        "desc": "Versi Transfer Learning dari AnomalyForensicNet: memadukan ConvNeXt-Tiny Pretrained dengan Zero-Mean Conv, Phase/Mag FFT, Inconsistency Attn & Top-K Pooling.",
+    },
 }
 
 # Deteksi model yang tersedia di penyimpanan lokal
@@ -447,6 +463,12 @@ def get_model(model_path: str, arch: str):
     elif arch in ("aiforensicnet_v4", "aiforensicnet_v4_universal"):
         from model_custom import AIForensicNetV4
         model = AIForensicNetV4(num_classes=2)
+    elif arch == "anomaly_forensicnet":
+        from model_custom import AnomalyForensicNet
+        model = AnomalyForensicNet(num_classes=2)
+    elif arch == "anomaly_forensicnet_tl":
+        from model_custom import AnomalyForensicNetTL
+        model = AnomalyForensicNetTL(num_classes=2, pretrained=False)
     else:
         model = models.efficientnet_b0(weights=None)
         in_features = model.classifier[1].in_features

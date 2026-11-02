@@ -1338,3 +1338,78 @@ class AnomalyForensicNet(nn.Module):
             mask_logits = self.mask_head(feat)  # (B, 1, 14, 14)
             return logits, mask_logits
         return logits
+
+
+class AnomalyForensicNetTL(nn.Module):
+    """
+    AnomalyForensicNet + Transfer Learning (Pretrained ConvNeXt-Tiny ImageNet-1K):
+    - Cabang 1 (Custom Anomaly Forensic Stream - 14x14):
+      Fixed 15-ch Filter Bank + 9-ch ZeroMeanConv2d + Phase/Magnitude 2D-FFT + Mix-Kernel (3x3 + 7x7) Blocks.
+    - Cabang 2 (Transfer Learning Semantic Stream - 14x14):
+      Pretrained ConvNeXt-Tiny mengekstrak fitur semantik konteks objek & bayangan, di-align ke grid 14x14.
+    - Fusi Spasial 14x14 + IntraImageInconsistencyAttention + TopKAnomalyPool2d (15%) + Dual-Task 14x14 Mask Head.
+    """
+    def __init__(self, num_classes: int = 2, pretrained: bool = True, dropout_p: float = 0.3):
+        super().__init__()
+        from torchvision import models
+        weights = models.ConvNeXt_Tiny_Weights.DEFAULT if pretrained else None
+        backbone = models.convnext_tiny(weights=weights)
+        self.tl_features = backbone.features
+        self.tl_proj = nn.Sequential(
+            nn.Conv2d(768, 192, kernel_size=1, bias=False),
+            LayerNorm2dClean(192),
+            nn.GELU()
+        )
+
+        # Custom Forensic + Phase/Mag FFT Stream
+        self.fixed_bank = MultiScaleForensicFilterBankV4()
+        self.zeromean_conv = ZeroMeanConv2d(3, 9, kernel_size=5)
+        self.forensic_stem = nn.Sequential(
+            nn.Conv2d(24, 32, kernel_size=3, stride=2, padding=1, bias=False),
+            LayerNorm2dClean(32),
+            nn.GELU()
+        )
+        self.spectral_stem = PhaseMagSpectralStem(in_c=3, out_c=32)
+        self.custom_fusion = nn.Sequential(
+            nn.Conv2d(64, 64, kernel_size=1, bias=False),
+            LayerNorm2dClean(64),
+            nn.GELU()
+        )
+        self.c_stage1 = nn.Sequential(MixKernelForensicBlock(64, 64, stride=2), MixKernelForensicBlock(64, 64))
+        self.c_stage2 = nn.Sequential(MixKernelForensicBlock(64, 128, stride=2), MixKernelForensicBlock(128, 128))
+        self.c_stage3 = nn.Sequential(MixKernelForensicBlock(128, 192, stride=2), MixKernelForensicBlock(192, 192))
+
+        # Spatial Gated Fusion pada grid 14x14 (192 TL + 192 Custom = 384 kanal)
+        self.inconsistency_attn = IntraImageInconsistencyAttention(384)
+        self.mask_head = nn.Sequential(
+            nn.Conv2d(384, 64, kernel_size=3, padding=1, bias=False),
+            LayerNorm2dClean(64),
+            nn.GELU(),
+            nn.Conv2d(64, 1, kernel_size=1)
+        )
+        self.pool = TopKAnomalyPool2d(topk_ratio=0.15)
+        self.head = nn.Sequential(
+            nn.Dropout(p=dropout_p),
+            nn.Linear(384 * 3, 192),
+            nn.LayerNorm(192),
+            nn.GELU(),
+            nn.Dropout(p=0.15),
+            nn.Linear(192, num_classes)
+        )
+
+    def forward(self, x: torch.Tensor, return_mask: bool = False):
+        # 1. Pretrained ConvNeXt-Tiny Stream -> (B, 192, 14, 14)
+        f_tl = self.tl_proj(self.tl_features(x))
+        f_tl = F.interpolate(f_tl, size=(14, 14), mode='bilinear', align_corners=False)
+
+        # 2. Custom Anomaly Forensic Stream -> (B, 192, 14, 14)
+        res_24 = torch.cat([self.fixed_bank(x), self.zeromean_conv(x)], dim=1)
+        f_c = self.custom_fusion(torch.cat([self.forensic_stem(res_24), self.spectral_stem(x)], dim=1))
+        f_c = self.c_stage3(self.c_stage2(self.c_stage1(f_c)))
+
+        # 3. Fusi 14x14 + Inconsistency Attention + Top-K Anomaly Pooling
+        feat = self.inconsistency_attn(torch.cat([f_tl, f_c], dim=1))
+        logits = self.head(self.pool(feat))
+        if return_mask:
+            return logits, self.mask_head(feat)
+        return logits
