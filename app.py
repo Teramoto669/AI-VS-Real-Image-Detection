@@ -378,21 +378,21 @@ MODELS_CONFIG = {
         "params": "2.93 Juta (From Scratch)",
         "desc": "Arsitektur V4 Universal untuk deteksi AI Generatif (CommunityForensics) & Manipulasi Spasial (DEFACTO Copy-Move, Splicing, Inpainting).",
     },
-    "AnomalyForensicNet (CF + Inpainting)": {
-        "paths": ["best_anomaly_forensicnet_cf_inpainting.pth", "backup/best_anomaly_forensicnet_cf_inpainting.pth"],
+    "AnomalyForensicNet (CommunityForensics)": {
+        "paths": ["best_anomaly_forensicnet_cf.pth", "best_anomaly_forensicnet_cf_inpainting.pth", "backup/best_anomaly_forensicnet_cf.pth", "backup/best_anomaly_forensicnet_cf_inpainting.pth"],
         "arch": "anomaly_forensicnet",
         "name": "AnomalyForensicNet",
         "arch_name": "Mix-Kernel Anomaly-Aware (From Scratch)",
-        "params": "2.47 Juta (From Scratch)",
-        "desc": "Arsitektur kustom from-scratch khusus inpainting: Zero-Mean Conv + Phase/Mag FFT + Mix-Kernel 3x3/7x7 + Inconsistency Attn + Top-K Pooling.",
+        "params": "2.41 Juta (OwensLab/CommunityForensics)",
+        "desc": "Arsitektur kustom from-scratch: Zero-Mean Conv + Phase/Mag 2D-FFT + Mix-Kernel 3x3/7x7 + Top-K Anomaly Pooling.",
     },
-    "AnomalyForensicNet TL (CF + Inpainting)": {
-        "paths": ["best_anomaly_forensicnet_tl_cf_inpainting.pth", "backup/best_anomaly_forensicnet_tl_cf_inpainting.pth"],
+    "AnomalyForensicNet TL (CommunityForensics)": {
+        "paths": ["best_anomaly_forensicnet_tl_cf.pth", "best_anomaly_forensicnet_tl_cf_inpainting.pth", "backup/best_anomaly_forensicnet_tl_cf.pth", "backup/best_anomaly_forensicnet_tl_cf_inpainting.pth"],
         "arch": "anomaly_forensicnet_tl",
         "name": "AnomalyForensicNet TL",
         "arch_name": "Hybrid AnomalyForensicNet + ConvNeXt-Tiny",
-        "params": "28.9 Juta (Hybrid Transfer Learning)",
-        "desc": "Versi Transfer Learning dari AnomalyForensicNet: memadukan ConvNeXt-Tiny Pretrained dengan Zero-Mean Conv, Phase/Mag FFT, Inconsistency Attn & Top-K Pooling.",
+        "params": "28.8 Juta (Hybrid Transfer Learning)",
+        "desc": "Versi Transfer Learning dari AnomalyForensicNet: memadukan ConvNeXt-Tiny Pretrained dengan Zero-Mean Conv, Phase/Mag 2D-FFT, Mix-Kernel & Top-K Pooling.",
     },
 }
 
@@ -477,7 +477,7 @@ def get_model(model_path: str, arch: str):
             nn.Linear(in_features, 2)
         )
 
-    model.load_state_dict(state_dict)
+    model.load_state_dict(state_dict, strict=False)
     model = model.to(device)
     model.eval()
 

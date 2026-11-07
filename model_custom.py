@@ -1243,7 +1243,7 @@ class IntraImageInconsistencyAttention(nn.Module):
 class TopKAnomalyPool2d(nn.Module):
     """
     Menggabungkan Mean + Std + Top-K (15%) Spatial Activation Pooling.
-    Mencegah sinyal inpainting lokal (5%-20% area gambar) tenggelam oleh rata-rata area asli.
+    Menangkap anomali artefak lokal maupun global secara simultan.
     """
     def __init__(self, topk_ratio: float = 0.15):
         super().__init__()
@@ -1263,13 +1263,10 @@ class TopKAnomalyPool2d(nn.Module):
 
 class AnomalyForensicNet(nn.Module):
     """
-    Rekomendasi Clean-Slate From-Scratch untuk CommunityForensics + DEFACTO Inpainting:
-    1. Hybrid Forensic Stem: Fixed 15-ch Filter Bank (SRM/Lap/DoG/NPR) + 9-ch Zero-Mean Conv + Phase/Mag 2D-FFT.
-    2. 4-Stage Mix-Kernel (3x3 + 7x7) Backbone dengan LayerNorm2d.
-    3. Intra-Image Inconsistency Attention (menyorot tambalan inpainting yang menyimpang dari background).
-    4. Dual-Task Output:
-       - Top-K (15%) + Mean + Std Pooling -> Klasifikasi (0: AI/Inpainted, 1: Real)
-       - Auxiliary 14x14 Anomaly Heatmap -> Lokalisasi area manipulasi/inpainting.
+    Simplified AnomalyForensicNet (From-Scratch) untuk CommunityForensics (AI vs Real):
+    1. Hybrid Forensic Stem: Fixed 15-ch Filter Bank (Lap3/Lap5/DoG/Sobel/NPR) + 9-ch Zero-Mean Conv + Phase/Mag 2D-FFT.
+    2. 4-Stage Mix-Kernel (3x3 + 7x7) Backbone dengan LayerNorm2d & Squeeze-Excitation.
+    3. Single-Task Classification dengan Top-K (15%) + Mean + Std Anomaly Pooling (0: AI-Generated, 1: Real).
     """
     def __init__(self, num_classes: int = 2, dropout_p: float = 0.3):
         super().__init__()
@@ -1301,17 +1298,6 @@ class AnomalyForensicNet(nn.Module):
         self.stage3 = nn.Sequential(MixKernelForensicBlock(128, 256, stride=2), MixKernelForensicBlock(256, 256))
         self.stage4 = nn.Sequential(MixKernelForensicBlock(256, 384, stride=2), MixKernelForensicBlock(384, 384))
 
-        # Intra-Image Patch Inconsistency Attention pada resolusi 14x14
-        self.inconsistency_attn = IntraImageInconsistencyAttention(384)
-
-        # Auxiliary Anomaly Localization Head (Peta 14x14: 1 = Fake/Inpainted, 0 = Real)
-        self.mask_head = nn.Sequential(
-            nn.Conv2d(384, 64, kernel_size=3, padding=1, bias=False),
-            LayerNorm2dClean(64),
-            nn.GELU(),
-            nn.Conv2d(64, 1, kernel_size=1)
-        )
-
         # Top-K (15%) + Mean + Std Pooling (384 * 3 = 1152-D)
         self.pool = TopKAnomalyPool2d(topk_ratio=0.15)
         self.head = nn.Sequential(
@@ -1323,31 +1309,32 @@ class AnomalyForensicNet(nn.Module):
             nn.Linear(192, num_classes)
         )
 
-    def forward(self, x: torch.Tensor, return_mask: bool = False):
+    def forward_features(self, x: torch.Tensor):
         res_24 = torch.cat([self.fixed_bank(x), self.zeromean_conv(x)], dim=1)
         f_for = self.forensic_stem(res_24)
         f_spec = self.spectral_stem(x)
         f_rgb = self.rgb_stem(x)
 
-        feat = self.fusion(torch.cat([f_for, f_spec, f_rgb], dim=1))
-        feat = self.stage4(self.stage3(self.stage2(self.stage1(feat))))
-        feat = self.inconsistency_attn(feat)
+        s0 = self.fusion(torch.cat([f_for, f_spec, f_rgb], dim=1))
+        s1 = self.stage1(s0)
+        s2 = self.stage2(s1)
+        s3 = self.stage3(s2)
+        s4 = self.stage4(s3)
+        return s0, s1, s2, s3, s4
 
-        logits = self.head(self.pool(feat))
-        if return_mask:
-            mask_logits = self.mask_head(feat)  # (B, 1, 14, 14)
-            return logits, mask_logits
-        return logits
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        _, _, _, _, s4 = self.forward_features(x)
+        return self.head(self.pool(s4))
 
 
 class AnomalyForensicNetTL(nn.Module):
     """
-    AnomalyForensicNet + Transfer Learning (Pretrained ConvNeXt-Tiny ImageNet-1K):
+    Simplified AnomalyForensicNet + Transfer Learning (Pretrained ConvNeXt-Tiny) untuk CommunityForensics:
     - Cabang 1 (Custom Anomaly Forensic Stream - 14x14):
       Fixed 15-ch Filter Bank + 9-ch ZeroMeanConv2d + Phase/Magnitude 2D-FFT + Mix-Kernel (3x3 + 7x7) Blocks.
     - Cabang 2 (Transfer Learning Semantic Stream - 14x14):
       Pretrained ConvNeXt-Tiny mengekstrak fitur semantik konteks objek & bayangan, di-align ke grid 14x14.
-    - Fusi Spasial 14x14 + IntraImageInconsistencyAttention + TopKAnomalyPool2d (15%) + Dual-Task 14x14 Mask Head.
+    - Fusi 14x14 + TopKAnomalyPool2d (15%) + Single-Task Classifier Head.
     """
     def __init__(self, num_classes: int = 2, pretrained: bool = True, dropout_p: float = 0.3):
         super().__init__()
@@ -1379,14 +1366,6 @@ class AnomalyForensicNetTL(nn.Module):
         self.c_stage2 = nn.Sequential(MixKernelForensicBlock(64, 128, stride=2), MixKernelForensicBlock(128, 128))
         self.c_stage3 = nn.Sequential(MixKernelForensicBlock(128, 192, stride=2), MixKernelForensicBlock(192, 192))
 
-        # Spatial Gated Fusion pada grid 14x14 (192 TL + 192 Custom = 384 kanal)
-        self.inconsistency_attn = IntraImageInconsistencyAttention(384)
-        self.mask_head = nn.Sequential(
-            nn.Conv2d(384, 64, kernel_size=3, padding=1, bias=False),
-            LayerNorm2dClean(64),
-            nn.GELU(),
-            nn.Conv2d(64, 1, kernel_size=1)
-        )
         self.pool = TopKAnomalyPool2d(topk_ratio=0.15)
         self.head = nn.Sequential(
             nn.Dropout(p=dropout_p),
@@ -1397,19 +1376,18 @@ class AnomalyForensicNetTL(nn.Module):
             nn.Linear(192, num_classes)
         )
 
-    def forward(self, x: torch.Tensor, return_mask: bool = False):
-        # 1. Pretrained ConvNeXt-Tiny Stream -> (B, 192, 14, 14)
+    def forward_features(self, x: torch.Tensor):
         f_tl = self.tl_proj(self.tl_features(x))
         f_tl = F.interpolate(f_tl, size=(14, 14), mode='bilinear', align_corners=False)
 
-        # 2. Custom Anomaly Forensic Stream -> (B, 192, 14, 14)
         res_24 = torch.cat([self.fixed_bank(x), self.zeromean_conv(x)], dim=1)
-        f_c = self.custom_fusion(torch.cat([self.forensic_stem(res_24), self.spectral_stem(x)], dim=1))
-        f_c = self.c_stage3(self.c_stage2(self.c_stage1(f_c)))
+        s0 = self.custom_fusion(torch.cat([self.forensic_stem(res_24), self.spectral_stem(x)], dim=1))
+        s1 = self.c_stage1(s0)
+        s2 = self.c_stage2(s1)
+        s3 = self.c_stage3(s2)
+        s4 = torch.cat([f_tl, s3], dim=1)
+        return s0, s1, s2, s3, s4
 
-        # 3. Fusi 14x14 + Inconsistency Attention + Top-K Anomaly Pooling
-        feat = self.inconsistency_attn(torch.cat([f_tl, f_c], dim=1))
-        logits = self.head(self.pool(feat))
-        if return_mask:
-            return logits, self.mask_head(feat)
-        return logits
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        _, _, _, _, s4 = self.forward_features(x)
+        return self.head(self.pool(s4))
