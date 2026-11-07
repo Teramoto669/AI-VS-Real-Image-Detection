@@ -520,7 +520,28 @@ def run_inference(image: Image.Image, model: nn.Module, device: torch.device, ar
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
 
-    if arch in ["aiforensicnet_v2", "aiforensicnet_v3", "aiforensicnet_v4", "aiforensicnet_v4_universal", "anomaly_forensicnet_cf", "anomaly_forensicnet_tl_cf"]:
+    if arch in ["anomaly_forensicnet_cf", "anomaly_forensicnet_tl_cf"]:
+        crop_size = 224
+        if min(w, h) < crop_size:
+            scale = float(crop_size) / float(min(w, h))
+            proc_img = rgb_image.resize((int(round(w * scale)), int(round(h * scale))), Image.Resampling.BILINEAR)
+            pw, ph = proc_img.size
+        else:
+            proc_img = rgb_image
+            pw, ph = w, h
+
+        cx, cy = (pw - crop_size) // 2, (ph - crop_size) // 2
+        center_patch = proc_img.crop((cx, cy, cx + crop_size, cy + crop_size))
+        t = norm_transform(center_patch)
+        batch_tensors = torch.stack([t, torch.flip(t, dims=[2])]).to(device)
+
+        with torch.no_grad():
+            probs = torch.softmax(model(batch_tensors), dim=1).mean(dim=0)
+            confidence, predicted_idx = torch.max(probs, 0)
+
+        ai_prob = probs[0].item() * 100.0
+        real_prob = probs[1].item() * 100.0
+    elif arch in ["aiforensicnet_v2", "aiforensicnet_v3", "aiforensicnet_v4", "aiforensicnet_v4_universal"]:
         crop_size = 224
         # Pastikan dimensi minimal memenuhi ukuran crop
         if min(w, h) < crop_size:
@@ -874,41 +895,28 @@ if active_image is not None:
             fake_title = "AI-Generated / Manipulated Image" if is_univ else "AI-Generated Image"
             fake_short = "AI / Manipulasi" if is_univ else "AI"
 
-            # Logika threshold cerdas & terkalibrasi:
-            # - Keyakinan Tinggi (>= 80%)
-            # - Keyakinan Sedang (>= 60%)
-            # - Daerah Ambigu / Modifikasi Parsial (40% - 59.9%)
-            if ai_prob >= 80.0:
+            # Logika threshold berdasarkan Confidence:
+            # - AI > 70%             : AI-Generated
+            # - Real > 57% (AI < 43%): Real Image
+            # - AI 43% s/d 70%       : Sebagian Diedit AI
+            if ai_prob > 70.0:
                 verdict_class = "verdict-ai"
                 label_color = "label-ai"
                 verdict_title = fake_title
-                sub_status = f"Tingkat Keyakinan Tinggi ({fake_short}: {ai_prob:.1f}%)"
+                sub_status = f"Confidence AI > 70% ({fake_short}: {ai_prob:.1f}%)"
                 badge_status = "AI / Manipulated" if is_univ else "AI-Generated"
-            elif real_prob >= 80.0:
+            elif real_prob > 57.0:
                 verdict_class = "verdict-real"
                 label_color = "label-real"
                 verdict_title = "Real Image"
-                sub_status = f"Tingkat Keyakinan Tinggi (Real: {real_prob:.1f}%)"
+                sub_status = f"Confidence Real > 57% (Real: {real_prob:.1f}% • {fake_short}: {ai_prob:.1f}%)"
                 badge_status = "Real Image"
-            elif ai_prob >= 60.0:
-                verdict_class = "verdict-ai"
-                label_color = "label-ai"
-                verdict_title = fake_title
-                sub_status = f"Tingkat Keyakinan Sedang ({fake_short}: {ai_prob:.1f}%)"
-                badge_status = "Cenderung Manipulasi" if is_univ else "Cenderung AI"
-            elif real_prob >= 60.0:
-                verdict_class = "verdict-real"
-                label_color = "label-real"
-                verdict_title = "Real Image"
-                sub_status = f"Tingkat Keyakinan Sedang (Real: {real_prob:.1f}%)"
-                badge_status = "Cenderung Real"
             else:
-                # Keyakinan di rentang ambigu (40% - 59.9%): terdeteksi sebagian diedit/dimodifikasi AI
                 verdict_class = "verdict-modified"
                 label_color = "label-modified"
-                verdict_title = "Gambar ini terdeteksi sebagian diedit atau dimodifikasi (AI / Splicing / Inpainting)"
-                sub_status = f"Tingkat Keyakinan Rendah / Ambigu ({fake_short}: {ai_prob:.1f}% vs Real: {real_prob:.1f}%)"
-                badge_status = "Sebagian Diedit"
+                verdict_title = "Sebagian Diedit AI"
+                sub_status = f"Confidence AI 43%–70% ({fake_short}: {ai_prob:.1f}% vs Real: {real_prob:.1f}%)"
+                badge_status = "Sebagian Diedit AI"
 
             st.markdown(f"""
             <div class="verdict-card {verdict_class}">

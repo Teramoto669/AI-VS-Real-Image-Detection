@@ -1153,6 +1153,49 @@ class LayerNorm2dClean(nn.Module):
         return self.weight[:, None, None] * ((x - u) / torch.sqrt(s + self.eps)) + self.bias[:, None, None]
 
 
+class AnomalyForensicFilterBank(nn.Module):
+    """Fixed 15-ch Forensic Filter Bank khusus AnomalyForensicNet: Lap3, Lap5, DoG, Sobel Mag, dan NPR * 4.0."""
+    def __init__(self):
+        super().__init__()
+        lap3 = torch.tensor([[0.0, -1.0, 0.0], [-1.0, 4.0, -1.0], [0.0, -1.0, 0.0]])
+        lap5 = torch.tensor([
+            [0.0,  0.0, -1.0,  0.0,  0.0],
+            [0.0, -1.0, -2.0, -1.0,  0.0],
+            [-1.0, -2.0, 16.0, -2.0, -1.0],
+            [0.0, -1.0, -2.0, -1.0,  0.0],
+            [0.0,  0.0, -1.0,  0.0,  0.0]
+        ]) / 4.0
+        dog5 = torch.tensor([
+            [-1.0, -3.0, -4.0, -3.0, -1.0],
+            [-3.0,  0.0,  6.0,  0.0, -3.0],
+            [-4.0,  6.0, 20.0,  6.0, -4.0],
+            [-3.0,  0.0,  6.0,  0.0, -3.0],
+            [-1.0, -3.0, -4.0, -3.0, -1.0]
+        ]) / 8.0
+        sobel_x = torch.tensor([[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]])
+        sobel_y = torch.tensor([[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]])
+
+        self.register_buffer("k_lap3", lap3.view(1, 1, 3, 3).repeat(3, 1, 1, 1))
+        self.register_buffer("k_lap5", lap5.view(1, 1, 5, 5).repeat(3, 1, 1, 1))
+        self.register_buffer("k_dog5", dog5.view(1, 1, 5, 5).repeat(3, 1, 1, 1))
+        self.register_buffer("k_sx", sobel_x.view(1, 1, 3, 3).repeat(3, 1, 1, 1))
+        self.register_buffer("k_sy", sobel_y.view(1, 1, 3, 3).repeat(3, 1, 1, 1))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        p1 = F.pad(x, (1, 1, 1, 1), mode="reflect")
+        p2 = F.pad(x, (2, 2, 2, 2), mode="reflect")
+        f_lap3 = F.conv2d(p1, self.k_lap3, groups=3)
+        f_lap5 = F.conv2d(p2, self.k_lap5, groups=3)
+        f_dog5 = F.conv2d(p2, self.k_dog5, groups=3)
+        gx = F.conv2d(p1, self.k_sx, groups=3)
+        gy = F.conv2d(p1, self.k_sy, groups=3)
+        f_sobel = torch.sqrt(gx * gx + gy * gy + 1e-6)
+        down = F.avg_pool2d(x, kernel_size=2, stride=2)
+        up = F.interpolate(down, size=x.shape[-2:], mode="nearest")
+        f_npr = (x - up) * 4.0
+        return torch.clamp(torch.cat([f_lap3, f_lap5, f_dog5, f_sobel, f_npr], dim=1), -5.0, 5.0)
+
+
 class ZeroMeanConv2d(nn.Module):
     """Learnable Forensic Filter dengan proyeksi zero-mean (sum(W) = 0) untuk menekan konten RGB."""
     def __init__(self, in_channels: int = 3, out_channels: int = 9, kernel_size: int = 5):
@@ -1279,7 +1322,7 @@ class AnomalyForensicNet(nn.Module):
     def __init__(self, num_classes: int = 2, dropout_p: float = 0.3, use_inconsistency_attn: bool = False):
         super().__init__()
         # Stem 1: Fixed 15-ch + Learnable Zero-Mean 9-ch = 24-ch Forensic Residual
-        self.fixed_bank = MultiScaleForensicFilterBankV4()
+        self.fixed_bank = AnomalyForensicFilterBank()
         self.zeromean_conv = ZeroMeanConv2d(3, 9, kernel_size=5)
         self.forensic_stem = nn.Sequential(
             nn.Conv2d(24, 32, kernel_size=3, stride=2, padding=1, bias=False),
@@ -1359,7 +1402,7 @@ class AnomalyForensicNetTL(nn.Module):
         )
 
         # Custom Forensic + Phase/Mag FFT Stream
-        self.fixed_bank = MultiScaleForensicFilterBankV4()
+        self.fixed_bank = AnomalyForensicFilterBank()
         self.zeromean_conv = ZeroMeanConv2d(3, 9, kernel_size=5)
         self.forensic_stem = nn.Sequential(
             nn.Conv2d(24, 32, kernel_size=3, stride=2, padding=1, bias=False),
