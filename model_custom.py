@@ -1154,26 +1154,20 @@ class LayerNorm2dClean(nn.Module):
 
 
 class ZeroMeanConv2d(nn.Module):
-    """Constrained Conv2d (sum of weights = 0, center = -1) untuk menekan konten objek & mengekstrak noise."""
-    def __init__(self, in_c: int = 3, out_c: int = 9, kernel_size: int = 5):
+    """Learnable Forensic Filter dengan proyeksi zero-mean (sum(W) = 0) untuk menekan konten RGB."""
+    def __init__(self, in_channels: int = 3, out_channels: int = 9, kernel_size: int = 5):
         super().__init__()
         self.padding = kernel_size // 2
-        self.c = kernel_size // 2
-        self.weight = nn.Parameter(torch.randn(out_c, in_c, kernel_size, kernel_size))
-        nn.init.xavier_uniform_(self.weight)
+        self.weight = nn.Parameter(torch.randn(out_channels, in_channels, kernel_size, kernel_size) * 0.02)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        mask = torch.ones_like(self.weight)
-        mask[:, :, self.c, self.c] = 0.0
-        w_masked = self.weight * mask
-        w_norm = w_masked / (w_masked.sum(dim=(2, 3), keepdim=True) + 1e-7)
-        center = torch.zeros_like(self.weight)
-        center[:, :, self.c, self.c] = 1.0
-        return F.conv2d(x, w_norm * mask - center, padding=self.padding)
+        w = self.weight - self.weight.mean(dim=(2, 3), keepdim=True)
+        w = w / (w.std(dim=(2, 3), keepdim=True) + 1e-5)
+        return F.conv2d(F.pad(x, (self.padding,) * 4, mode="reflect"), w)
 
 
 class PhaseMagSpectralStem(nn.Module):
-    """Mengekstrak Log-Magnitude DAN Phase Spectrum 2D-FFT (peka terhadap kerusakan fase inpainting)."""
+    """Mengekstrak Log-Magnitude DAN Phase Spectrum dari 2D-FFT (6 kanal -> out_c)."""
     def __init__(self, in_c: int = 3, out_c: int = 32):
         super().__init__()
         self.proj = nn.Sequential(
@@ -1183,38 +1177,52 @@ class PhaseMagSpectralStem(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        fft = torch.fft.fft2(x.float(), norm='ortho')
-        fft_shift = torch.fft.fftshift(fft, dim=(-2, -1))
-        mag = torch.log1p(torch.abs(fft_shift))
-        phase = torch.angle(fft_shift) / 3.14159265
-        spec = torch.cat([mag, phase], dim=1).to(x.dtype)
+        orig_dtype = x.dtype
+        fft = torch.fft.fft2(x.float(), norm="ortho")
+        fft_shifted = torch.fft.fftshift(fft, dim=(-2, -1))
+        mag = torch.log1p(torch.abs(fft_shifted))
+        mag = mag / (mag.amax(dim=(-2, -1), keepdim=True) + 1e-6)
+        phase = torch.angle(fft_shifted) / 3.14159265
+        spec = torch.cat([mag, phase], dim=1).to(orig_dtype)
         return self.proj(spec)
 
 
+class AnomalySqueezeExcitation(nn.Module):
+    def __init__(self, channels: int, reduction: int = 4):
+        super().__init__()
+        mid = max(8, channels // reduction)
+        self.fc = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(channels, mid, 1),
+            nn.GELU(),
+            nn.Conv2d(mid, channels, 1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x * self.fc(x)
+
+
 class MixKernelForensicBlock(nn.Module):
-    """
-    Dual-Receptive Field Block (Mix-Kernel 3x3 + 7x7 Depthwise + LayerNorm2d + SE):
-    - 3x3 menangkap batas tepi jahitan (seam boundary) inpainting yang tajam.
-    - 7x7 menangkap pola periodik upsampling difusi/GAN.
-    """
+    """Konvolusi Depthwise Paralel 3x3 (lokal) + 7x7 (konteks) dengan Inverted Bottleneck & SE."""
     def __init__(self, in_c: int, out_c: int, stride: int = 1):
         super().__init__()
-        self.dw3 = nn.Conv2d(in_c, in_c, kernel_size=3, stride=stride, padding=1, groups=in_c, bias=False)
-        self.dw7 = nn.Conv2d(in_c, in_c, kernel_size=7, stride=stride, padding=3, groups=in_c, bias=False)
+        self.dw3 = nn.Conv2d(in_c, in_c, 3, stride=stride, padding=1, groups=in_c, bias=False)
+        self.dw7 = nn.Conv2d(in_c, in_c, 7, stride=stride, padding=3, groups=in_c, bias=False)
         self.norm = LayerNorm2dClean(in_c)
-        self.pw1 = nn.Conv2d(in_c, out_c * 2, kernel_size=1)
+        self.pw1 = nn.Conv2d(in_c, out_c * 2, 1, bias=False)
         self.act = nn.GELU()
-        self.pw2 = nn.Conv2d(out_c * 2, out_c, kernel_size=1)
-        self.se = SqueezeExcitation(out_c)
-        self.shortcut = nn.Sequential(
-            nn.Conv2d(in_c, out_c, kernel_size=1, stride=stride, bias=False),
-            LayerNorm2dClean(out_c)
-        ) if stride != 1 or in_c != out_c else nn.Identity()
+        self.pw2 = nn.Conv2d(out_c * 2, out_c, 1, bias=False)
+        self.se = AnomalySqueezeExcitation(out_c)
+        self.skip = (
+            nn.Sequential(nn.Conv2d(in_c, out_c, 1, stride=stride, bias=False), LayerNorm2dClean(out_c))
+            if (stride != 1 or in_c != out_c) else nn.Identity()
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         feat = self.norm(self.dw3(x) + self.dw7(x))
         feat = self.se(self.pw2(self.act(self.pw1(feat))))
-        return feat + self.shortcut(x)
+        return feat + self.skip(x)
 
 
 class IntraImageInconsistencyAttention(nn.Module):
@@ -1268,7 +1276,7 @@ class AnomalyForensicNet(nn.Module):
     2. 4-Stage Mix-Kernel (3x3 + 7x7) Backbone dengan LayerNorm2d & Squeeze-Excitation.
     3. Single-Task Classification dengan Top-K (15%) + Mean + Std Anomaly Pooling (0: AI-Generated, 1: Real).
     """
-    def __init__(self, num_classes: int = 2, dropout_p: float = 0.3):
+    def __init__(self, num_classes: int = 2, dropout_p: float = 0.3, use_inconsistency_attn: bool = False):
         super().__init__()
         # Stem 1: Fixed 15-ch + Learnable Zero-Mean 9-ch = 24-ch Forensic Residual
         self.fixed_bank = MultiScaleForensicFilterBankV4()
@@ -1298,6 +1306,8 @@ class AnomalyForensicNet(nn.Module):
         self.stage3 = nn.Sequential(MixKernelForensicBlock(128, 256, stride=2), MixKernelForensicBlock(256, 256))
         self.stage4 = nn.Sequential(MixKernelForensicBlock(256, 384, stride=2), MixKernelForensicBlock(384, 384))
 
+        self.inconsistency_attn = IntraImageInconsistencyAttention(384) if use_inconsistency_attn else nn.Identity()
+
         # Top-K (15%) + Mean + Std Pooling (384 * 3 = 1152-D)
         self.pool = TopKAnomalyPool2d(topk_ratio=0.15)
         self.head = nn.Sequential(
@@ -1319,7 +1329,7 @@ class AnomalyForensicNet(nn.Module):
         s1 = self.stage1(s0)
         s2 = self.stage2(s1)
         s3 = self.stage3(s2)
-        s4 = self.stage4(s3)
+        s4 = self.inconsistency_attn(self.stage4(s3))
         return s0, s1, s2, s3, s4
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -1336,7 +1346,7 @@ class AnomalyForensicNetTL(nn.Module):
       Pretrained ConvNeXt-Tiny mengekstrak fitur semantik konteks objek & bayangan, di-align ke grid 14x14.
     - Fusi 14x14 + TopKAnomalyPool2d (15%) + Single-Task Classifier Head.
     """
-    def __init__(self, num_classes: int = 2, pretrained: bool = True, dropout_p: float = 0.3):
+    def __init__(self, num_classes: int = 2, pretrained: bool = True, dropout_p: float = 0.3, use_inconsistency_attn: bool = False):
         super().__init__()
         from torchvision import models
         weights = models.ConvNeXt_Tiny_Weights.DEFAULT if pretrained else None
@@ -1366,6 +1376,8 @@ class AnomalyForensicNetTL(nn.Module):
         self.c_stage2 = nn.Sequential(MixKernelForensicBlock(64, 128, stride=2), MixKernelForensicBlock(128, 128))
         self.c_stage3 = nn.Sequential(MixKernelForensicBlock(128, 192, stride=2), MixKernelForensicBlock(192, 192))
 
+        self.inconsistency_attn = IntraImageInconsistencyAttention(384) if use_inconsistency_attn else nn.Identity()
+
         self.pool = TopKAnomalyPool2d(topk_ratio=0.15)
         self.head = nn.Sequential(
             nn.Dropout(p=dropout_p),
@@ -1385,7 +1397,7 @@ class AnomalyForensicNetTL(nn.Module):
         s1 = self.c_stage1(s0)
         s2 = self.c_stage2(s1)
         s3 = self.c_stage3(s2)
-        s4 = torch.cat([f_tl, s3], dim=1)
+        s4 = self.inconsistency_attn(torch.cat([f_tl, s3], dim=1))
         return s0, s1, s2, s3, s4
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

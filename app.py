@@ -379,20 +379,36 @@ MODELS_CONFIG = {
         "desc": "Arsitektur V4 Universal untuk deteksi AI Generatif (CommunityForensics) & Manipulasi Spasial (DEFACTO Copy-Move, Splicing, Inpainting).",
     },
     "AnomalyForensicNet (CommunityForensics)": {
-        "paths": ["best_anomaly_forensicnet_cf.pth", "best_anomaly_forensicnet_cf_inpainting.pth", "backup/best_anomaly_forensicnet_cf.pth", "backup/best_anomaly_forensicnet_cf_inpainting.pth"],
-        "arch": "anomaly_forensicnet",
-        "name": "AnomalyForensicNet",
-        "arch_name": "Mix-Kernel Anomaly-Aware (From Scratch)",
+        "paths": ["best_anomaly_forensicnet_cf.pth", "backup/best_anomaly_forensicnet_cf.pth"],
+        "arch": "anomaly_forensicnet_cf",
+        "name": "AnomalyForensicNet (CF)",
+        "arch_name": "Simplified Mix-Kernel Forensic (From Scratch)",
         "params": "2.41 Juta (OwensLab/CommunityForensics)",
-        "desc": "Arsitektur kustom from-scratch: Zero-Mean Conv + Phase/Mag 2D-FFT + Mix-Kernel 3x3/7x7 + Top-K Anomaly Pooling.",
+        "desc": "Arsitektur AnomalyForensicNet yang disederhanakan khusus CommunityForensics: Zero-Mean Conv + Phase/Mag 2D-FFT + Mix-Kernel 3x3/7x7 + Top-K Pooling.",
     },
     "AnomalyForensicNet TL (CommunityForensics)": {
-        "paths": ["best_anomaly_forensicnet_tl_cf.pth", "best_anomaly_forensicnet_tl_cf_inpainting.pth", "backup/best_anomaly_forensicnet_tl_cf.pth", "backup/best_anomaly_forensicnet_tl_cf_inpainting.pth"],
+        "paths": ["best_anomaly_forensicnet_tl_cf.pth", "backup/best_anomaly_forensicnet_tl_cf.pth"],
+        "arch": "anomaly_forensicnet_tl_cf",
+        "name": "AnomalyForensicNet TL (CF)",
+        "arch_name": "Simplified Hybrid AnomalyForensicNet + ConvNeXt-Tiny",
+        "params": "28.8 Juta (OwensLab/CommunityForensics)",
+        "desc": "Versi Transfer Learning yang disederhanakan khusus CommunityForensics: ConvNeXt-Tiny + Zero-Mean Conv + Phase/Mag 2D-FFT + Top-K Pooling.",
+    },
+    "AnomalyForensicNet (CF + Inpainting)": {
+        "paths": ["best_anomaly_forensicnet_cf_inpainting.pth", "backup/best_anomaly_forensicnet_cf_inpainting.pth"],
+        "arch": "anomaly_forensicnet",
+        "name": "AnomalyForensicNet (Inpainting)",
+        "arch_name": "Mix-Kernel Anomaly-Aware (From Scratch)",
+        "params": "2.47 Juta (CF + DEFACTO Inpainting)",
+        "desc": "Arsitektur kustom from-scratch khusus inpainting: Zero-Mean Conv + Phase/Mag FFT + Mix-Kernel 3x3/7x7 + Inconsistency Attn + Top-K Pooling.",
+    },
+    "AnomalyForensicNet TL (CF + Inpainting)": {
+        "paths": ["best_anomaly_forensicnet_tl_cf_inpainting.pth", "backup/best_anomaly_forensicnet_tl_cf_inpainting.pth"],
         "arch": "anomaly_forensicnet_tl",
-        "name": "AnomalyForensicNet TL",
+        "name": "AnomalyForensicNet TL (Inpainting)",
         "arch_name": "Hybrid AnomalyForensicNet + ConvNeXt-Tiny",
-        "params": "28.8 Juta (Hybrid Transfer Learning)",
-        "desc": "Versi Transfer Learning dari AnomalyForensicNet: memadukan ConvNeXt-Tiny Pretrained dengan Zero-Mean Conv, Phase/Mag 2D-FFT, Mix-Kernel & Top-K Pooling.",
+        "params": "28.9 Juta (CF + DEFACTO Inpainting)",
+        "desc": "Versi Transfer Learning dari AnomalyForensicNet: memadukan ConvNeXt-Tiny Pretrained dengan Zero-Mean Conv, Phase/Mag FFT, Inconsistency Attn & Top-K Pooling.",
     },
 }
 
@@ -463,12 +479,14 @@ def get_model(model_path: str, arch: str):
     elif arch in ("aiforensicnet_v4", "aiforensicnet_v4_universal"):
         from model_custom import AIForensicNetV4
         model = AIForensicNetV4(num_classes=2)
-    elif arch == "anomaly_forensicnet":
+    elif arch in ("anomaly_forensicnet", "anomaly_forensicnet_cf"):
         from model_custom import AnomalyForensicNet
-        model = AnomalyForensicNet(num_classes=2)
-    elif arch == "anomaly_forensicnet_tl":
+        has_inconsistency = any(k.startswith("inconsistency_attn.") for k in state_dict.keys())
+        model = AnomalyForensicNet(num_classes=2, use_inconsistency_attn=has_inconsistency)
+    elif arch in ("anomaly_forensicnet_tl", "anomaly_forensicnet_tl_cf"):
         from model_custom import AnomalyForensicNetTL
-        model = AnomalyForensicNetTL(num_classes=2, pretrained=False)
+        has_inconsistency = any(k.startswith("inconsistency_attn.") for k in state_dict.keys())
+        model = AnomalyForensicNetTL(num_classes=2, pretrained=False, use_inconsistency_attn=has_inconsistency)
     else:
         model = models.efficientnet_b0(weights=None)
         in_features = model.classifier[1].in_features
@@ -502,7 +520,7 @@ def run_inference(image: Image.Image, model: nn.Module, device: torch.device, ar
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
     ])
 
-    if arch in ["aiforensicnet_v2", "aiforensicnet_v3", "aiforensicnet_v4", "aiforensicnet_v4_universal"]:
+    if arch in ["aiforensicnet_v2", "aiforensicnet_v3", "aiforensicnet_v4", "aiforensicnet_v4_universal", "anomaly_forensicnet_cf", "anomaly_forensicnet_tl_cf"]:
         crop_size = 224
         # Pastikan dimensi minimal memenuhi ukuran crop
         if min(w, h) < crop_size:
